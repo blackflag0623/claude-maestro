@@ -1,6 +1,9 @@
 import { MaestroApi } from './api';
 import { TerminalNode, type NodeStatus } from './node';
+import { attachPathPicker } from './path-picker';
 import {
+  exportBundle,
+  importBundle,
   loadState,
   reconcileNodes,
   saveState,
@@ -45,7 +48,14 @@ const $status = document.getElementById('status') as HTMLSpanElement;
 const $stage = document.getElementById('stage') as HTMLDivElement;
 const $empty = document.getElementById('empty') as HTMLDivElement;
 const $btnAddServer = document.getElementById('btn-add-server') as HTMLButtonElement;
+const $btnExport = document.getElementById('btn-export') as HTMLButtonElement;
+const $btnImport = document.getElementById('btn-import') as HTMLButtonElement;
+const $importFile = document.getElementById('import-file') as HTMLInputElement;
 const $modalServer = document.getElementById('modal-server') as HTMLDialogElement;
+const $modalNode = document.getElementById('modal-node') as HTMLDialogElement;
+const $formNode = document.getElementById('form-node') as HTMLFormElement;
+const $nodeServerLabel = document.getElementById('node-server-label') as HTMLParagraphElement;
+const $nodeError = document.getElementById('node-error') as HTMLParagraphElement;
 const $formServer = document.getElementById('form-server') as HTMLFormElement;
 const $serverError = document.getElementById('server-error') as HTMLParagraphElement;
 const $hudServers = document.getElementById('hud-servers') as HTMLElement;
@@ -138,7 +148,7 @@ function renderServer(srv: ServerEntry): HTMLLIElement {
     $nodes.appendChild(renderNodeRow(ref, info));
   }
 
-  li.querySelector('[data-act="new-node"]')!.addEventListener('click', () => createNode(srv.id));
+  li.querySelector('[data-act="new-node"]')!.addEventListener('click', () => openNodeModal(srv.id));
   li.querySelector('[data-act="refresh"]')!.addEventListener('click', () => refreshServer(srv.id));
   li.querySelector('[data-act="remove"]')!.addEventListener('click', () => removeServer(srv.id));
 
@@ -250,20 +260,36 @@ function removeServer(serverId: string) {
   showEmptyIfNeeded();
 }
 
-async function createNode(serverId: string) {
+async function createNode(serverId: string, body: { title?: string; cwd: string }) {
   const rt = runtimeFor(serverId);
   let session: SessionInfo;
   try {
-    session = await rt.api.create({});
+    session = await rt.api.create(body);
   } catch (err) {
-    alert(`failed to create node: ${(err as Error).message}`);
-    return;
+    throw new Error((err as Error).message);
   }
   const ref: NodeRef = { serverId, sessionId: session.id, title: session.title };
   (state.knownNodes[serverId] ??= []).push(ref);
   rt.sessions = [...rt.sessions, session];
+  state.lastCwd[serverId] = body.cwd;
   persist();
   selectNode(ref);
+}
+
+let nodeModalServerId: string | null = null;
+const cwdInput = $formNode.elements.namedItem('cwd') as HTMLInputElement;
+const pathPicker = attachPathPicker(cwdInput);
+
+function openNodeModal(serverId: string) {
+  nodeModalServerId = serverId;
+  const srv = state.servers.find((s) => s.id === serverId);
+  $nodeServerLabel.innerHTML = `on server <strong>${escapeHtml(srv?.name ?? '?')}</strong>`;
+  $nodeError.textContent = '';
+  $formNode.reset();
+  cwdInput.value = state.lastCwd[serverId] ?? '';
+  pathPicker.setApi(runtimeFor(serverId).api);
+  $modalNode.showModal();
+  setTimeout(() => cwdInput.focus(), 0);
 }
 
 async function killNode(serverId: string, sessionId: string) {
@@ -325,9 +351,71 @@ $btnAddServer.addEventListener('click', () => {
   $formServer.reset();
   $modalServer.showModal();
 });
+
+$btnExport.addEventListener('click', () => {
+  const bundle = exportBundle(state);
+  const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `maestro-servers-${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+});
+
+$btnImport.addEventListener('click', () => $importFile.click());
+$importFile.addEventListener('change', async () => {
+  const file = $importFile.files?.[0];
+  $importFile.value = '';
+  if (!file) return;
+  let bundle: unknown;
+  try {
+    bundle = JSON.parse(await file.text());
+  } catch {
+    alert('import failed: file is not valid JSON');
+    return;
+  }
+  let result;
+  try {
+    ({ state, result } = importBundle(state, bundle));
+  } catch (err) {
+    alert(`import failed: ${(err as Error).message}`);
+    return;
+  }
+  persist();
+  scheduleRender();
+  refreshAll();
+  alert(`imported ${result.added} server(s); skipped ${result.skipped} duplicate(s)`);
+});
 $modalServer.addEventListener('click', (e) => {
   const t = e.target as HTMLElement;
   if (t.dataset.close !== undefined) $modalServer.close();
+});
+$modalNode.addEventListener('click', (e) => {
+  const t = e.target as HTMLElement;
+  if (t.dataset.close !== undefined) $modalNode.close();
+});
+$formNode.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!nodeModalServerId) return;
+  const fd = new FormData($formNode);
+  const title = String(fd.get('title') ?? '').trim();
+  const cwd = String(fd.get('cwd') ?? '').trim();
+  if (!cwd) {
+    $nodeError.textContent = 'working directory is required';
+    return;
+  }
+  $nodeError.textContent = 'spawning…';
+  try {
+    await createNode(nodeModalServerId, { title: title || undefined, cwd });
+  } catch (err) {
+    $nodeError.textContent = `failed: ${(err as Error).message}`;
+    return;
+  }
+  $nodeError.textContent = '';
+  $modalNode.close();
 });
 $formServer.addEventListener('submit', async (e) => {
   e.preventDefault();

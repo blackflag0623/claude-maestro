@@ -1,6 +1,7 @@
 import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
+import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
@@ -15,52 +16,99 @@ import type {
 
 const PORT = Number(process.env.PORT ?? 4050);
 const SCROLLBACK_BYTES = 256 * 1024;
+const STORE_DIR =
+  process.env.MAESTRO_STORE_DIR ??
+  path.join(os.homedir(), '.claude-maestro');
+const STORE_FILE = path.join(STORE_DIR, 'sessions.json');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-interface Session {
+interface PersistedSession {
   id: string;
   title: string;
-  shell: string;
-  term: pty.IPty;
+  cwd: string;
+  createdAt: number;
+  hasResumeData: boolean; // false until first run actually persists conversation
+}
+
+interface Session extends PersistedSession {
+  term: pty.IPty | null; // null = dormant (not yet revived this maestro process)
   cols: number;
   rows: number;
-  createdAt: number;
   alive: boolean;
   exitCode: number | null;
-  scrollback: string; // bounded ring (truncated from the head)
+  scrollback: string;
   subscribers: Set<WebSocket>;
 }
 
 const sessions = new Map<string, Session>();
 
-function pickShell(): { file: string; args: string[] } {
-  if (process.platform === 'win32') return { file: 'powershell.exe', args: [] };
-  return { file: process.env.SHELL ?? '/bin/bash', args: [] };
+// ───────── persistence ─────────
+
+function persist() {
+  const payload: PersistedSession[] = [...sessions.values()].map((s) => ({
+    id: s.id,
+    title: s.title,
+    cwd: s.cwd,
+    createdAt: s.createdAt,
+    hasResumeData: s.hasResumeData,
+  }));
+  try {
+    fs.mkdirSync(STORE_DIR, { recursive: true });
+    fs.writeFileSync(STORE_FILE, JSON.stringify(payload, null, 2));
+  } catch (err) {
+    console.error('[maestro] persist failed:', (err as Error).message);
+  }
 }
+
+function loadPersisted() {
+  if (!fs.existsSync(STORE_FILE)) return;
+  let raw: PersistedSession[];
+  try {
+    raw = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
+  } catch (err) {
+    console.error('[maestro] could not parse store, ignoring:', (err as Error).message);
+    return;
+  }
+  for (const p of raw) {
+    if (!p?.id || !p?.cwd) continue;
+    sessions.set(p.id, {
+      id: p.id,
+      title: p.title ?? `node-${p.id.slice(0, 4)}`,
+      cwd: p.cwd,
+      createdAt: p.createdAt ?? Date.now(),
+      hasResumeData: p.hasResumeData ?? false,
+      term: null,
+      cols: 120,
+      rows: 30,
+      alive: false,
+      exitCode: null,
+      scrollback: '',
+      subscribers: new Set(),
+    });
+  }
+  console.log(`[maestro] restored ${sessions.size} dormant session(s) from ${STORE_FILE}`);
+}
+
+// ───────── helpers ─────────
+
+const CLAUDE_BIN = process.env.MAESTRO_CLAUDE_BIN ?? 'claude';
 
 function toInfo(s: Session): SessionInfo {
   return {
     id: s.id,
-    shell: s.shell,
+    shell: CLAUDE_BIN,
+    cwd: s.cwd,
     cols: s.cols,
     rows: s.rows,
     createdAt: s.createdAt,
     alive: s.alive,
     title: s.title,
+    attached: s.term !== null,
   };
-}
-
-function resizeSession(s: Session, cols: number, rows: number) {
-  try {
-    s.term.resize(Math.max(1, cols), Math.max(1, rows));
-    s.cols = cols;
-    s.rows = rows;
-  } catch {}
 }
 
 function appendScrollback(s: Session, data: string) {
   s.scrollback += data;
-  // Amortized O(1): only compact when well over the limit.
   if (s.scrollback.length > SCROLLBACK_BYTES * 1.5) {
     s.scrollback = s.scrollback.slice(-SCROLLBACK_BYTES);
   }
@@ -73,95 +121,115 @@ function broadcast(s: Session, msg: ServerMessage) {
   }
 }
 
-function createSession(body: CreateSessionBody): Session {
-  const shell = pickShell();
-  const cwd = process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
-  const cols = body.cols ?? 120;
-  const rows = body.rows ?? 30;
-  const id = crypto.randomUUID();
+function resizeSession(s: Session, cols: number, rows: number) {
+  s.cols = cols;
+  s.rows = rows;
+  if (!s.term) return;
+  try {
+    s.term.resize(Math.max(1, cols), Math.max(1, rows));
+  } catch {}
+}
 
-  const term = pty.spawn(shell.file, shell.args, {
+// ───────── PTY spawn ─────────
+
+/** Spawn `claude` with --session-id (new) or --resume (existing). */
+function spawnClaude(s: Session, mode: 'new' | 'resume') {
+  const args =
+    mode === 'new'
+      ? ['--session-id', s.id]
+      : ['--resume', s.id];
+
+  // node-pty wants an absolute / on-PATH executable name; cross-platform
+  // resolution is delegated to the OS via shell-less spawn (uses PATH).
+  const term = pty.spawn(CLAUDE_BIN, args, {
     name: 'xterm-256color',
-    cols,
-    rows,
-    cwd,
-    env: { ...process.env, MAESTRO_SESSION: id } as Record<string, string>,
+    cols: s.cols,
+    rows: s.rows,
+    cwd: s.cwd,
+    env: { ...process.env, MAESTRO_SESSION: s.id } as Record<string, string>,
   });
 
-  const session: Session = {
+  s.term = term;
+  s.alive = true;
+  s.exitCode = null;
+
+  term.onData((data: string) => {
+    appendScrollback(s, data);
+    broadcast(s, { type: 'output', data });
+    // Once we've seen *any* output, the conversation file exists on disk.
+    if (!s.hasResumeData) {
+      s.hasResumeData = true;
+      persist();
+    }
+  });
+
+  term.onExit(({ exitCode }) => {
+    s.alive = false;
+    s.exitCode = exitCode;
+    s.term = null;
+    broadcast(s, { type: 'exit', code: exitCode });
+  });
+}
+
+function ensureSpawned(s: Session) {
+  if (s.term) return;
+  spawnClaude(s, s.hasResumeData ? 'resume' : 'new');
+}
+
+// ───────── lifecycle ─────────
+
+function createSession(body: CreateSessionBody): Session {
+  const id = crypto.randomUUID();
+  const cwd = body.cwd?.trim() || os.homedir();
+  if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
+    throw new Error(`cwd does not exist or is not a directory: ${cwd}`);
+  }
+  const s: Session = {
     id,
-    title: body.title ?? `node-${id.slice(0, 4)}`,
-    shell: shell.file,
-    term,
-    cols,
-    rows,
+    title: body.title?.trim() || `node-${id.slice(0, 4)}`,
+    cwd,
     createdAt: Date.now(),
-    alive: true,
+    hasResumeData: false,
+    term: null,
+    cols: body.cols ?? 120,
+    rows: body.rows ?? 30,
+    alive: false,
     exitCode: null,
     scrollback: '',
     subscribers: new Set(),
   };
-
-  // Auto-launch `claude` once a shell prompt appears (or after 5s).
-  let promptSeen = false;
-  let promptBuf = '';
-  const promptRegex = /(?:[>$#]\s)$/;
-  const ansiStrip = /\x1b\[[0-9;?]*[a-zA-Z]/g;
-
-  const launchClaude = () => {
-    if (promptSeen) return;
-    promptSeen = true;
-    term.write('claude\r');
-  };
-
-  term.onData((data: string) => {
-    appendScrollback(session, data);
-    broadcast(session, { type: 'output', data });
-
-    if (!promptSeen) {
-      promptBuf += data;
-      if (promptBuf.length > 4096) promptBuf = promptBuf.slice(-4096);
-      if (promptRegex.test(promptBuf.replace(ansiStrip, ''))) launchClaude();
-    }
-  });
-
-  const fallback = setTimeout(launchClaude, 5000);
-
-  term.onExit(({ exitCode }) => {
-    clearTimeout(fallback);
-    session.alive = false;
-    session.exitCode = exitCode;
-    broadcast(session, { type: 'exit', code: exitCode });
-  });
-
-  sessions.set(id, session);
-  return session;
+  sessions.set(id, s);
+  persist();
+  spawnClaude(s, 'new');
+  return s;
 }
 
 function killSession(id: string): boolean {
   const s = sessions.get(id);
   if (!s) return false;
-  // Tell subscribers we're going away so they don't reconnect-loop.
   broadcast(s, { type: 'exit', code: s.exitCode });
-  try {
-    s.term.kill();
-  } catch {}
+  if (s.term) {
+    try {
+      s.term.kill();
+    } catch {}
+  }
   for (const ws of s.subscribers) {
     try {
       ws.close();
     } catch {}
   }
   sessions.delete(id);
+  persist();
+  // Note: leaves ~/.claude/projects/<slug>/<uuid>.jsonl on disk; user can
+  // still rehydrate via `claude --resume <uuid>` from a shell if desired.
   return true;
 }
 
-// ---------- HTTP ----------
+// ───────── HTTP ─────────
 
 const app = express();
 app.use(express.json());
 
-// Permissive CORS: the portal may be served from a different origin pointing
-// at this maestro by URL. Trust assumed via network reachability.
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', req.headers.origin ?? '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
@@ -175,7 +243,7 @@ app.use((req, res, next) => {
 });
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, name: 'claude-maestro', version: 1, sessions: sessions.size });
+  res.json({ ok: true, name: 'claude-maestro', version: 2, sessions: sessions.size });
 });
 
 app.get('/api/sessions', (_req, res) => {
@@ -184,8 +252,12 @@ app.get('/api/sessions', (_req, res) => {
 
 app.post('/api/sessions', (req, res) => {
   const body = (req.body ?? {}) as CreateSessionBody;
-  const s = createSession(body);
-  res.status(201).json({ session: toInfo(s) });
+  try {
+    const s = createSession(body);
+    res.status(201).json({ session: toInfo(s) });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
 });
 
 app.delete('/api/sessions/:id', (req, res) => {
@@ -197,10 +269,60 @@ app.delete('/api/sessions/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-// Serve built client (only useful in production — `npm start` after build).
-// In dev (`tsx watch src/server/index.ts`), __dirname resolves into src/, so
-// guard against accidentally serving raw .ts source files which the browser
-// rejects as MPEG-TS.
+// ───────── filesystem completion ─────────
+
+const FS_LIMIT = 50;
+const FS_EXCLUDE = new Set(['node_modules']);
+
+function expandHome(p: string): string {
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+app.get('/api/fs/complete', (req, res) => {
+  const raw = String(req.query.prefix ?? '').trim();
+  const showHidden = raw.includes('/.') || raw.includes('\\.') || /(?:^|[\\/])\.[^\\/]*$/.test(raw);
+
+  const expanded = expandHome(raw || '~');
+  const sep = expanded.includes('\\') ? '\\' : '/';
+  const endsWithSep = /[\\/]$/.test(expanded);
+
+  let dir: string;
+  let needle: string;
+  if (!raw) {
+    dir = os.homedir();
+    needle = '';
+  } else if (endsWithSep) {
+    dir = expanded;
+    needle = '';
+  } else {
+    dir = path.dirname(expanded);
+    needle = path.basename(expanded);
+  }
+
+  let dirents: fs.Dirent[];
+  try {
+    dirents = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    res.json({ base: dir, entries: [] });
+    return;
+  }
+
+  const needleLower = needle.toLowerCase();
+  const out: string[] = [];
+  for (const d of dirents) {
+    if (!d.isDirectory()) continue;
+    if (FS_EXCLUDE.has(d.name)) continue;
+    if (!showHidden && d.name.startsWith('.')) continue;
+    if (needleLower && !d.name.toLowerCase().startsWith(needleLower)) continue;
+    out.push(path.join(dir, d.name) + sep);
+    if (out.length >= FS_LIMIT) break;
+  }
+  out.sort((a, b) => a.localeCompare(b));
+  res.json({ base: dir, entries: out });
+});
+
 const clientDist = path.resolve(__dirname, '../client');
 const isDevSource = clientDist.includes(`${path.sep}src${path.sep}`);
 if (isDevSource) {
@@ -260,13 +382,25 @@ function attach(ws: WebSocket, sessionId: string) {
       if (attached) return;
       attached = true;
       resizeSession(s, msg.cols, msg.rows);
+      // Lazy-revive: if session is dormant (e.g. restored from disk on boot),
+      // spawn `claude --resume <uuid>` now that someone wants it.
+      try {
+        ensureSpawned(s);
+      } catch (err) {
+        const reply: ServerMessage = {
+          type: 'error',
+          message: `failed to spawn claude: ${(err as Error).message}`,
+        };
+        ws.send(JSON.stringify(reply));
+        return;
+      }
       const reply: ServerMessage = {
         type: 'attached',
         session: toInfo(s),
         scrollback: s.scrollback,
       };
       ws.send(JSON.stringify(reply));
-      if (!s.alive) {
+      if (!s.alive && s.exitCode !== null) {
         ws.send(JSON.stringify({ type: 'exit', code: s.exitCode } satisfies ServerMessage));
       }
       return;
@@ -275,7 +409,7 @@ function attach(ws: WebSocket, sessionId: string) {
     if (!attached) return;
 
     if (msg.type === 'input') {
-      if (s.alive) s.term.write(msg.data);
+      if (s.alive && s.term) s.term.write(msg.data);
     } else if (msg.type === 'resize') {
       resizeSession(s, msg.cols, msg.rows);
     }
@@ -286,6 +420,9 @@ function attach(ws: WebSocket, sessionId: string) {
   });
 }
 
+loadPersisted();
+
 server.listen(PORT, () => {
   console.log(`[maestro] http + ws on http://127.0.0.1:${PORT}`);
+  console.log(`[maestro] store: ${STORE_FILE}`);
 });

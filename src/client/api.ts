@@ -47,4 +47,10 @@ export class MaestroApi {
     });
     if (!r.ok && r.status !== 404) throw new Error(`kill ${r.status}`);
   }
+
+  async completePath(prefix: string): Promise<{ base: string; entries: string[] }> {
+    const r = await fetch(this.url(`/api/fs/complete?prefix=${encodeURIComponent(prefix)}`));
+    if (!r.ok) throw new Error(`complete ${r.status}`);
+    return r.json();
+  }
 }

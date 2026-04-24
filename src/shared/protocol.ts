@@ -13,17 +13,22 @@
 export interface SessionInfo {
   id: string;
   shell: string;
+  cwd: string;
   cols: number;
   rows: number;
   createdAt: number; // epoch ms
   alive: boolean;
   title: string;
+  /** False until the PTY is spawned. Persisted-but-not-yet-attached sessions
+   * created by a previous maestro process start out dormant. */
+  attached: boolean;
 }
 
 export interface CreateSessionBody {
   cols?: number;
   rows?: number;
   title?: string;
+  cwd?: string;
 }
 
 export type ClientMessage =

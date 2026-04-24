@@ -254,6 +254,12 @@ button { font: inherit; color: inherit; }
   white-space: nowrap;
 }
 
+.sidebar__head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
 .icon-btn {
   background: transparent;
   border: 1px solid transparent;
@@ -660,6 +666,66 @@ button { font: inherit; color: inherit; }
   color: var(--err);
   min-height: 1em;
   letter-spacing: 0.04em;
+}
+.field__sub {
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+  margin-top: 2px;
+}
+.field__hint-inline {
+  font-style: normal;
+  font-weight: 400;
+  font-size: 9px;
+  color: var(--muted);
+  margin-left: 6px;
+}
+.modal__intro {
+  margin: 12px 18px 0;
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
+.modal__intro strong {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+/* ───────── path picker ───────── */
+
+.path-picker {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  z-index: 10;
+  background: var(--bone);
+  border: 1.5px solid var(--ink);
+  border-top: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  box-shadow: 4px 4px 0 var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.path-picker__item {
+  padding: 5px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-top: 1px dotted rgba(10, 10, 10, 0.15);
+}
+.path-picker__item:first-child { border-top: 0; }
+.path-picker__item:hover {
+  background: var(--bone-2);
+}
+.path-picker__item[aria-selected="true"] {
+  background: var(--ink);
+  color: var(--lime);
 }
 
 /* ───────── scrollbar ───────── */

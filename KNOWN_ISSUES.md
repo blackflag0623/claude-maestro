@@ -20,11 +20,11 @@ Tracks known limitations, upstream quirks, and platform restrictions affecting c
 
 ## Server (node-pty / shell auto-launch)
 
-### Sessions are in-memory only — restarting the server kills everything
+### Scrollback (terminal output) is lost on maestro restart
 
-- **Symptom:** After `npm run dev` restart (server side), all previously-created nodes vanish; the client shows them as gone after the next refresh.
-- **Root cause:** `sessions: Map<id, Session>` lives in process memory. PTYs are children of the maestro process and die with it. No on-disk persistence.
-- **Workaround:** Treat server restarts as session-destructive. If durability across restarts is needed, persist `SessionInfo` + scrollback to disk and respawn PTYs on boot — non-trivial because the in-flight `claude` process state cannot be recovered.
+- **Symptom:** After restarting `npm run dev` (server side), reattaching to a previously-running node shows an empty terminal — `claude` is rehydrated mid-conversation but the visual scrollback before the restart is gone.
+- **Root cause:** Scrollback is the rendered ANSI byte stream from xterm; it lives in maestro's process memory (256 KB ring per session) and is not persisted. The Claude *conversation* itself is rebuilt by `claude --resume <uuid>` from its on-disk JSONL, but xterm has nothing to replay against.
+- **Workaround:** None within maestro. The conversation history is preserved — just scroll up inside the rehydrated Claude TUI to see prior turns.
 
 ---
 

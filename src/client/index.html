@@ -28,7 +28,11 @@
               <span class="sidebar__heading-num">01</span>
               servers
             </span>
-            <button class="btn btn--ghost" id="btn-add-server" title="add server">+ add</button>
+            <span class="sidebar__head-actions">
+              <button class="icon-btn" id="btn-export" title="export server list" aria-label="export">↑</button>
+              <button class="icon-btn" id="btn-import" title="import server list" aria-label="import">↓</button>
+              <button class="btn btn--ghost" id="btn-add-server" title="add server">+ add</button>
+            </span>
           </div>
           <ul class="server-list" id="server-list"></ul>
         </div>
@@ -128,6 +132,38 @@
       </form>
     </dialog>
 
+    <dialog class="modal" id="modal-node">
+      <form method="dialog" class="modal__form" id="form-node">
+        <header class="modal__head">
+          <span class="modal__kicker">new entry</span>
+          <h2>spawn a <em>node</em></h2>
+          <button type="button" class="modal__x" data-close aria-label="close">×</button>
+        </header>
+        <p class="modal__intro" id="node-server-label">on server <strong>—</strong></p>
+        <label class="field">
+          <span class="field__label">title <em class="field__hint-inline">optional</em></span>
+          <input name="title" maxlength="40" placeholder="payments-refactor, scratch, ..." autocomplete="off" />
+        </label>
+        <label class="field">
+          <span class="field__label">working directory</span>
+          <input
+            name="cwd"
+            required
+            placeholder="/Users/you/projects/foo"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <span class="field__sub">claude is launched here. must exist on the server.</span>
+        </label>
+        <p class="field__hint" id="node-error"></p>
+        <footer class="modal__foot">
+          <button type="button" class="btn" data-close>cancel</button>
+          <button type="submit" class="btn btn--primary">spawn node</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <input type="file" id="import-file" accept="application/json,.json" hidden />
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

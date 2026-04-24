@@ -23,14 +23,17 @@ A browser portal that manages multiple `claude-maestro` backends, each hosting 1
 
 Express + `ws` `WebSocketServer` (manual `noServer:true` upgrade, gated by `?sessionId=`), sharing one HTTP listener.
 
-- **Session registry** — `sessions: Map<id, Session>`. Each `Session` owns one `@lydell/node-pty` process plus a 256 KB scrollback ring buffer (raw bytes including ANSI). Sessions persist across WS disconnects; multiple WS subscribers can attach to the same session simultaneously and all receive output.
-- **Auto-launch claude** — per session, after detecting a shell prompt via `/(?:[>$#]\s)$/` against ANSI-stripped output (or 5 s fallback), the server writes `claude\r` into the PTY.
+- **Session model** — each session's UUID **is** the `claude` CLI session id. New sessions spawn `claude --session-id <uuid>`; sessions revived from disk spawn `claude --resume <uuid>`. The shell is bypassed entirely (no PowerShell/bash wrapper).
+- **Persistence on disk** — `~/.claude-maestro/sessions.json` (override via `MAESTRO_STORE_DIR`) holds `{id, title, cwd, createdAt, hasResumeData}` per session. On boot the server loads this file and registers each session as **dormant** (no PTY spawned). The PTY is spawned lazily when the first WS client attaches.
+- **Per-process state** — `Map<id, Session>` carries the dormant metadata plus `term` (PTY handle, null when dormant), 256 KB scrollback ring, subscribers Set. Multiple WS subscribers can attach simultaneously.
+- **Conversation continuity** — Claude itself writes the conversation to `~/.claude/projects/<cwd-slug>/<uuid>.jsonl`. That file is what `--resume` reads, so killing the maestro process (or the host) loses scrollback but **not** the conversation.
+- **Auto-launch** — none needed: `claude` is the PTY's process, so there's no shell prompt to detect.
 - **HTTP API** (CORS-permissive — assumes network-level trust):
   - `GET  /api/health` → `{ ok, sessions }`
   - `GET  /api/sessions` → `{ sessions: SessionInfo[] }`
-  - `POST /api/sessions` body `CreateSessionBody` → `{ session }`
-  - `DELETE /api/sessions/:id` → `{ ok: true }`
-- **WebSocket** — `GET /maestro-ws?sessionId=<id>` upgrades. Client must send `{type:'attach', cols, rows}` first; server replies with `{type:'attached', session, scrollback}` (replays full ring buffer) then streams live `{type:'output'}` messages. If the PTY has already exited, an `{type:'exit'}` is sent right after `attached`.
+  - `POST /api/sessions` body `CreateSessionBody` (`{cwd, title?, cols?, rows?}`) → `{ session }`. **`cwd` must be an existing directory on the maestro host** or the call returns 400.
+  - `DELETE /api/sessions/:id` → `{ ok: true }`. Removes from the registry and persistence file. The Claude conversation file under `~/.claude/projects/...` is left intact.
+- **WebSocket** — `GET /maestro-ws?sessionId=<id>` upgrades. Client sends `{type:'attach', cols, rows}`; if the session is dormant the server spawns `claude --resume <uuid>` here, then replies with `{type:'attached', session, scrollback}` (replays the in-memory ring), then streams live `{type:'output'}`.
 
 ### Client (`src/client/`)
 
@@ -46,9 +49,10 @@ Express + `ws` `WebSocketServer` (manual `noServer:true` upgrade, gated by `?ses
 
 ### Persistence semantics
 
-- **Sessions live on the server.** Closing/reloading the browser does not kill them. Removing a server from the portal does not kill its sessions.
-- **Killing a node** (`DELETE /api/sessions/:id`) is destructive — the PTY and child `claude` process die.
-- **Scrollback is bounded to 256 KB per session** in memory only; restarting the maestro server loses all sessions.
+- **Sessions persist across maestro restart** via `~/.claude-maestro/sessions.json` (the registry) plus Claude's own `~/.claude/projects/<slug>/<uuid>.jsonl` (the conversation). After a maestro restart, sessions appear in the API as `attached: false` (dormant) until a client attaches and triggers `claude --resume <uuid>`.
+- **Closing/reloading the browser does not affect sessions.** Removing a server from the portal does not kill its sessions.
+- **Killing a node** (`DELETE /api/sessions/:id`) removes the session from the registry. The underlying Claude conversation file is left on disk for manual recovery via `claude --resume <uuid>` from a shell.
+- **Scrollback (terminal pixels) is lost on maestro restart.** The conversation (Claude's history of messages and tool calls) is not.
 
 ## Conventions
 
