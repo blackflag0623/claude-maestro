@@ -12,7 +12,7 @@ import {
   type PersistedState,
   type ServerEntry,
 } from './state';
-import type { SessionInfo } from '../shared/protocol';
+import type { SessionInfo, SessionActivity } from '../shared/protocol';
 
 type ServerHealth = 'online' | 'offline' | 'unknown';
 type TopbarStatus = NodeStatus | 'idle';
@@ -160,13 +160,16 @@ function renderNodeRow(ref: NodeRef, info?: SessionInfo): HTMLLIElement {
   li.className = 'node';
   if (isActive(ref)) li.setAttribute('aria-current', 'true');
 
-  const localStatus = nodes.get(nodeKey(ref.serverId, ref.sessionId))?.status;
+  const local = nodes.get(nodeKey(ref.serverId, ref.sessionId));
+  const localStatus = local?.status;
   const liveAlive = info?.alive ?? true;
   li.dataset.state = localStatus ?? (liveAlive ? 'connecting' : 'exited');
+  li.dataset.activity = local?.activity ?? info?.activity ?? 'unknown';
 
   li.innerHTML = `
     <span class="node__bar"></span>
     <span class="node__title">${escapeHtml(ref.title)}</span>
+    <span class="node__activity" title="${escapeHtml(activityLabel(li.dataset.activity as SessionActivity))}"></span>
     <button class="node__kill" title="kill node" aria-label="kill">×</button>
   `;
   li.addEventListener('click', (e) => {
@@ -178,6 +181,13 @@ function renderNodeRow(ref: NodeRef, info?: SessionInfo): HTMLLIElement {
     killNode(ref.serverId, ref.sessionId);
   });
   return li;
+}
+
+function activityLabel(a: SessionActivity): string {
+  if (a === 'working') return 'claude is working';
+  if (a === 'waiting') return 'waiting on you (permission/notify)';
+  if (a === 'idle') return 'idle — awaiting prompt';
+  return 'state unknown';
 }
 
 const HTML_ESCAPES: Record<string, string> = {
@@ -321,6 +331,9 @@ function selectNode(ref: NodeRef) {
     node = new TerminalNode(runtimeFor(ref.serverId).api, ref.sessionId, {
       status: (s) => {
         if (isActive(ref)) setStatus(s);
+        scheduleRender();
+      },
+      activity: () => {
         scheduleRender();
       },
       title: (t) => {

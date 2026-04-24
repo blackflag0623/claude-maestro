@@ -10,6 +10,8 @@
 //                                     before any input. On attach the server replays
 //                                     the scrollback buffer, then streams live output.
 
+export type SessionActivity = 'unknown' | 'working' | 'waiting' | 'idle';
+
 export interface SessionInfo {
   id: string;
   shell: string;
@@ -22,6 +24,8 @@ export interface SessionInfo {
   /** False until the PTY is spawned. Persisted-but-not-yet-attached sessions
    * created by a previous maestro process start out dormant. */
   attached: boolean;
+  /** Claude's current state, derived from hook callbacks. */
+  activity: SessionActivity;
 }
 
 export interface CreateSessionBody {
@@ -39,5 +43,6 @@ export type ClientMessage =
 export type ServerMessage =
   | { type: 'attached'; session: SessionInfo; scrollback: string }
   | { type: 'output'; data: string }
+  | { type: 'activity'; activity: SessionActivity }
   | { type: 'exit'; code: number | null }
   | { type: 'error'; message: string };

@@ -298,7 +298,7 @@ button { font: inherit; color: inherit; }
 .node-list { list-style: none; margin: 0; padding: 0 0 0 16px; }
 .node {
   display: grid;
-  grid-template-columns: 4px 1fr auto;
+  grid-template-columns: 4px 1fr auto auto;
   align-items: center;
   gap: 8px;
   padding: 5px 6px;
@@ -324,6 +324,30 @@ button { font: inherit; color: inherit; }
 .node[data-state="reconnecting"] .node__bar { background: var(--warn); animation: blink 800ms steps(2,end) infinite; }
 .node[data-state="exited"] .node__bar { background: var(--err); }
 .node__title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.node__activity {
+  width: 7px;
+  height: 7px;
+  border: 1px solid currentColor;
+  background: transparent;
+  opacity: 0.45;
+  flex: 0 0 auto;
+  transition: background 120ms linear, opacity 120ms linear;
+}
+.node[data-activity="working"] .node__activity {
+  background: var(--lime);
+  border-color: var(--lime);
+  opacity: 1;
+  animation: blink 700ms steps(2,end) infinite;
+}
+.node[data-activity="waiting"] .node__activity {
+  background: var(--warn);
+  border-color: var(--warn);
+  opacity: 1;
+}
+.node[data-activity="idle"] .node__activity {
+  background: transparent;
+  opacity: 0.7;
+}
 .node__kill {
   background: transparent;
   border: 0;

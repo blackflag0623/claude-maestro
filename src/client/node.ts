@@ -1,7 +1,7 @@
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import type { ClientMessage, ServerMessage, SessionInfo } from '../shared/protocol';
+import type { ClientMessage, ServerMessage, SessionInfo, SessionActivity } from '../shared/protocol';
 import type { MaestroApi } from './api';
 
 export type NodeStatus = 'connecting' | 'live' | 'reconnecting' | 'exited' | 'error';
@@ -9,6 +9,7 @@ export type NodeStatus = 'connecting' | 'live' | 'reconnecting' | 'exited' | 'er
 export interface NodeEvents {
   status?: (s: NodeStatus) => void;
   title?: (t: string) => void;
+  activity?: (a: SessionActivity) => void;
 }
 
 /**
@@ -26,6 +27,7 @@ export class TerminalNode {
   private destroyed = false;
   private resizeObserver: ResizeObserver | null = null;
   private _status: NodeStatus = 'connecting';
+  private _activity: SessionActivity = 'unknown';
   session: SessionInfo | null = null;
 
   constructor(
@@ -99,9 +101,19 @@ export class TerminalNode {
     return this._status;
   }
 
+  get activity(): SessionActivity {
+    return this._activity;
+  }
+
   private setStatus(s: NodeStatus) {
     this._status = s;
     this.events.status?.(s);
+  }
+
+  private setActivity(a: SessionActivity) {
+    if (this._activity === a) return;
+    this._activity = a;
+    this.events.activity?.(a);
   }
 
   private send(msg: ClientMessage) {
@@ -182,12 +194,16 @@ export class TerminalNode {
         this.session = msg.session;
         if (msg.scrollback) this.term.write(msg.scrollback);
         this.setStatus(msg.session.alive ? 'live' : 'exited');
+        this.setActivity(msg.session.activity ?? 'unknown');
         this.events.title?.(msg.session.title);
       } else if (msg.type === 'output') {
         this.term.write(msg.data);
+      } else if (msg.type === 'activity') {
+        this.setActivity(msg.activity);
       } else if (msg.type === 'exit') {
         this.term.write(`\r\n\x1b[2m[process exited: ${msg.code}]\x1b[0m\r\n`);
         this.setStatus('exited');
+        this.setActivity('unknown');
       } else if (msg.type === 'error') {
         this.term.write(`\r\n\x1b[31m[error: ${msg.message}]\x1b[0m\r\n`);
         this.setStatus('error');

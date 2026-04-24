@@ -11,6 +11,7 @@ import type {
   ClientMessage,
   ServerMessage,
   SessionInfo,
+  SessionActivity,
   CreateSessionBody,
 } from '../shared/protocol.js';
 
@@ -38,6 +39,7 @@ interface Session extends PersistedSession {
   exitCode: number | null;
   scrollback: string;
   subscribers: Set<WebSocket>;
+  activity: SessionActivity;
 }
 
 const sessions = new Map<string, Session>();
@@ -84,6 +86,7 @@ function loadPersisted() {
       exitCode: null,
       scrollback: '',
       subscribers: new Set(),
+      activity: 'unknown',
     });
   }
   console.log(`[maestro] restored ${sessions.size} dormant session(s) from ${STORE_FILE}`);
@@ -128,6 +131,7 @@ function toInfo(s: Session): SessionInfo {
     alive: s.alive,
     title: s.title,
     attached: s.term !== null,
+    activity: s.activity,
   };
 }
 
@@ -160,14 +164,68 @@ function expandHome(p: string): string {
   return p;
 }
 
+function setActivity(s: Session, a: SessionActivity) {
+  if (s.activity === a) return;
+  s.activity = a;
+  broadcast(s, { type: 'activity', activity: a });
+}
+
+// ───────── hooks (per-session activity tracking) ─────────
+
+const HOOK_SCRIPT = path.join(STORE_DIR, 'hook.sh');
+const HOOK_SETTINGS = path.join(STORE_DIR, 'hooks.json');
+const HOOK_URL = `http://127.0.0.1:${PORT}/api/hook`;
+const HOOKS_ENABLED = process.platform !== 'win32';
+
+const HOOK_ACTIVITY: Record<string, SessionActivity> = {
+  UserPromptSubmit: 'working',
+  PreToolUse: 'working',
+  PostToolUse: 'working',
+  Notification: 'waiting',
+  Stop: 'idle',
+};
+
+function ensureHookFiles() {
+  if (!HOOKS_ENABLED) return;
+  try {
+    fs.mkdirSync(STORE_DIR, { recursive: true });
+    const script = `#!/bin/sh
+# claude-maestro hook → POST event to local maestro for activity tracking.
+# Stream stdin straight to curl, fire-and-forget; never block claude.
+exec >/dev/null 2>&1
+curl -fsS --max-time 2 -X POST \\
+  -H 'content-type: application/json' \\
+  -H "x-maestro-event: $1" \\
+  --data-binary @- \\
+  "${HOOK_URL}" &
+exit 0
+`;
+    fs.writeFileSync(HOOK_SCRIPT, script);
+    fs.chmodSync(HOOK_SCRIPT, 0o755);
+    const settings = {
+      hooks: Object.fromEntries(
+        Object.keys(HOOK_ACTIVITY).map((event) => [
+          event,
+          [{ hooks: [{ type: 'command', command: `${HOOK_SCRIPT} ${event}` }] }],
+        ]),
+      ),
+    };
+    fs.writeFileSync(HOOK_SETTINGS, JSON.stringify(settings, null, 2));
+  } catch (err) {
+    console.error('[maestro] could not write hook files:', (err as Error).message);
+  }
+}
+
 // ───────── PTY spawn ─────────
 
 /** Spawn `claude` with --session-id (new) or --resume (existing). */
 function spawnClaude(s: Session, mode: 'new' | 'resume') {
-  const args =
+  const baseArgs =
     mode === 'new'
       ? ['--session-id', s.id]
       : ['--resume', s.id];
+  const hookArgs = HOOKS_ENABLED ? ['--settings', HOOK_SETTINGS] : [];
+  const args = [...baseArgs, ...hookArgs];
 
   let term: pty.IPty;
   try {
@@ -202,6 +260,7 @@ function spawnClaude(s: Session, mode: 'new' | 'resume') {
     s.alive = false;
     s.exitCode = exitCode;
     s.term = null;
+    setActivity(s, 'unknown');
     broadcast(s, { type: 'exit', code: exitCode });
   });
 }
@@ -232,6 +291,7 @@ function createSession(body: CreateSessionBody): Session {
     exitCode: null,
     scrollback: '',
     subscribers: new Set(),
+    activity: 'unknown',
   };
   sessions.set(id, s);
   try {
@@ -307,6 +367,17 @@ app.delete('/api/sessions/:id', (req, res) => {
     return;
   }
   res.json({ ok: true });
+});
+
+// Hook callback: claude posts here from the wrapper script. The event name
+// arrives in `x-maestro-event`; the JSON body always contains `session_id`.
+app.post('/api/hook', (req, res) => {
+  const event = String(req.headers['x-maestro-event'] ?? '');
+  const sid = (req.body?.session_id as string | undefined) ?? '';
+  const next = HOOK_ACTIVITY[event];
+  const s = sid ? sessions.get(sid) : undefined;
+  if (s && next) setActivity(s, next);
+  res.status(204).end();
 });
 
 // ───────── filesystem completion ─────────
@@ -455,6 +526,7 @@ function attach(ws: WebSocket, sessionId: string) {
 }
 
 loadPersisted();
+ensureHookFiles();
 
 server.listen(PORT, () => {
   console.log(`[maestro] http + ws on http://127.0.0.1:${PORT}`);
