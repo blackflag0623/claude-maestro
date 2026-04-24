@@ -48,6 +48,12 @@ const $btnAddServer = document.getElementById('btn-add-server') as HTMLButtonEle
 const $modalServer = document.getElementById('modal-server') as HTMLDialogElement;
 const $formServer = document.getElementById('form-server') as HTMLFormElement;
 const $serverError = document.getElementById('server-error') as HTMLParagraphElement;
+const $hudServers = document.getElementById('hud-servers') as HTMLElement;
+const $hudNodes = document.getElementById('hud-nodes') as HTMLElement;
+const $hudUptime = document.getElementById('hud-uptime') as HTMLElement;
+const $stageTag = document.querySelector('.mark--tag') as HTMLElement | null;
+
+const bootedAt = Date.now();
 
 let renderScheduled = false;
 function scheduleRender() {
@@ -57,8 +63,38 @@ function scheduleRender() {
     renderScheduled = false;
     renderSidebar();
     renderTopbar();
+    renderHud();
+    renderStageTag();
   });
 }
+
+function renderHud() {
+  $hudServers.textContent = String(state.servers.length).padStart(2, '0');
+  let total = 0;
+  for (const list of Object.values(state.knownNodes)) total += list.length;
+  $hudNodes.textContent = String(total).padStart(2, '0');
+}
+
+function renderStageTag() {
+  if (!$stageTag) return;
+  const a = state.activeNode;
+  $stageTag.textContent = a
+    ? `stage / ${a.title} · ${a.sessionId.slice(0, 8)}`
+    : 'stage / channel-01';
+}
+
+function pad2(n: number) {
+  return n < 10 ? `0${n}` : String(n);
+}
+function tickUptime() {
+  const s = Math.floor((Date.now() - bootedAt) / 1000);
+  const hh = pad2(Math.floor(s / 3600));
+  const mm = pad2(Math.floor((s % 3600) / 60));
+  const ss = pad2(s % 60);
+  $hudUptime.textContent = `${hh}:${mm}:${ss}`;
+}
+setInterval(tickUptime, 1000);
+tickUptime();
 
 function renderSidebar() {
   $serverList.innerHTML = '';
@@ -326,6 +362,8 @@ if (state.activeNode) {
 scheduleRender();
 showEmptyIfNeeded();
 refreshAll();
+
+setTimeout(() => document.querySelector('.app')?.removeAttribute('data-boot'), 1500);
 
 setInterval(() => {
   if (document.hidden) return;

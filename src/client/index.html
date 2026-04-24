@@ -7,34 +7,52 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,800&family=JetBrains+Mono:wght@400;500;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,ital,wght@9..144,0,400;9..144,0,800;9..144,1,800&family=JetBrains+Mono:wght@400;500;700&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="./styles.css" />
     <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230a0a0a'/><rect x='6' y='14' width='4' height='4' fill='%23c6ff3d'/></svg>" />
   </head>
   <body>
-    <div class="app">
-      <aside class="sidebar" aria-label="servers and nodes">
+    <div class="app" data-boot="1">
+      <aside class="sidebar" aria-label="servers and nodes" style="--reveal:0">
         <div class="brand">
-          <span class="brand__prefix">claude /</span>
-          <span class="brand__mark">maestro</span>
+          <span class="brand__prefix">claude / op.</span>
+          <span class="brand__mark">maestro<em class="brand__dot">.</em></span>
+          <span class="brand__suffix">a control surface for terminal nodes</span>
         </div>
 
         <div class="sidebar__section">
           <div class="sidebar__head">
-            <span class="sidebar__heading">servers</span>
+            <span class="sidebar__heading">
+              <span class="sidebar__heading-num">01</span>
+              servers
+            </span>
             <button class="btn btn--ghost" id="btn-add-server" title="add server">+ add</button>
           </div>
           <ul class="server-list" id="server-list"></ul>
         </div>
 
         <div class="sidebar__foot">
-          <span class="legend">esc · sidebar &nbsp; / &nbsp; ⌘k · new node</span>
+          <dl class="hud">
+            <div class="hud__row">
+              <dt>servers</dt>
+              <dd id="hud-servers">0</dd>
+            </div>
+            <div class="hud__row">
+              <dt>nodes</dt>
+              <dd id="hud-nodes">0</dd>
+            </div>
+            <div class="hud__row">
+              <dt>uptime</dt>
+              <dd id="hud-uptime">00:00:00</dd>
+            </div>
+          </dl>
+          <span class="legend">v0.0.1 — built in winter</span>
         </div>
       </aside>
 
-      <section class="main">
+      <section class="main" style="--reveal:1">
         <header class="topbar">
           <div class="topbar__crumbs" id="crumbs">
             <span class="crumb crumb--muted">no node selected</span>
@@ -48,28 +66,48 @@
         </header>
 
         <div class="stage" id="stage">
+          <div class="stage__marks" aria-hidden="true">
+            <span class="mark mark--tl">+</span>
+            <span class="mark mark--tr">+</span>
+            <span class="mark mark--bl">+</span>
+            <span class="mark mark--br">+</span>
+            <span class="mark mark--tag">stage / channel-01</span>
+          </div>
           <div class="empty" id="empty">
-            <div class="empty__rule"></div>
-            <h1 class="empty__title">no node attached</h1>
-            <p class="empty__body">
-              add a maestro server, then create a node to launch a Claude Code instance inside it.
-            </p>
-            <div class="empty__rule"></div>
+            <div class="empty__hero">
+              <span class="empty__kicker">— ready —</span>
+              <h1 class="empty__title">
+                instrument<br />
+                <em>not&nbsp;a&nbsp;toy.</em>
+              </h1>
+              <p class="empty__body">
+                add a <span class="kbd">maestro</span> server, then strike
+                <span class="kbd">+ node</span> to launch a Claude Code instance inside it.
+                state and scrollback survive reload.
+              </p>
+            </div>
+            <div class="empty__legend">
+              <span>esc — sidebar</span>
+              <span>·</span>
+              <span>⌘k — new node</span>
+              <span>·</span>
+              <span>⌘v — paste</span>
+            </div>
           </div>
         </div>
       </section>
     </div>
 
-    <!-- Add-server modal -->
     <dialog class="modal" id="modal-server">
       <form method="dialog" class="modal__form" id="form-server">
         <header class="modal__head">
-          <h2>add maestro server</h2>
+          <span class="modal__kicker">new entry</span>
+          <h2>add a <em>maestro</em> server</h2>
           <button type="button" class="modal__x" data-close aria-label="close">×</button>
         </header>
         <label class="field">
           <span class="field__label">label</span>
-          <input name="name" required maxlength="40" placeholder="prod-east, lab, ..." />
+          <input name="name" required maxlength="40" placeholder="prod-east, lab, ..." autocomplete="off" />
         </label>
         <label class="field">
           <span class="field__label">base url</span>
@@ -79,6 +117,7 @@
             type="url"
             placeholder="http://10.0.1.20:4050"
             pattern="https?://.+"
+            autocomplete="off"
           />
         </label>
         <p class="field__hint" id="server-error"></p>
