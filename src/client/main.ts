@@ -122,13 +122,13 @@ function renderServer(srv: ServerEntry): HTMLLIElement {
     <div class="server__row">
       <span class="server__dot"></span>
       <span class="server__name">${escapeHtml(srv.name)}</span>
+      <button class="icon-btn" data-act="refresh" title="refresh" aria-label="refresh">↻</button>
+      <button class="icon-btn icon-btn--danger" data-act="remove" title="remove server" aria-label="remove">×</button>
     </div>
     <div class="server__url">${escapeHtml(srv.baseUrl)}</div>
     <ul class="node-list"></ul>
     <div class="server__actions">
-      <button class="btn btn--small" data-act="new-node">+ node</button>
-      <button class="btn btn--small" data-act="refresh">refresh</button>
-      <button class="btn btn--small" data-act="remove">remove</button>
+      <button class="btn btn--block" data-act="new-node">+ node</button>
     </div>
   `;
 
