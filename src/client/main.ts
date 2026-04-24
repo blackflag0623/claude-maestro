@@ -262,12 +262,7 @@ function removeServer(serverId: string) {
 
 async function createNode(serverId: string, body: { title?: string; cwd: string }) {
   const rt = runtimeFor(serverId);
-  let session: SessionInfo;
-  try {
-    session = await rt.api.create(body);
-  } catch (err) {
-    throw new Error((err as Error).message);
-  }
+  const session = await rt.api.create(body);
   const ref: NodeRef = { serverId, sessionId: session.id, title: session.title };
   (state.knownNodes[serverId] ??= []).push(ref);
   rt.sessions = [...rt.sessions, session];
@@ -296,7 +291,10 @@ async function killNode(serverId: string, sessionId: string) {
   if (!confirm('Kill this node? The PTY and Claude process will terminate.')) return;
   try {
     await runtimeFor(serverId).api.kill(sessionId);
-  } catch {}
+  } catch (err) {
+    alert(`failed to kill node: ${(err as Error).message}`);
+    return;
+  }
   const key = nodeKey(serverId, sessionId);
   nodes.get(key)?.destroy();
   nodes.delete(key);
@@ -306,7 +304,6 @@ async function killNode(serverId: string, sessionId: string) {
   if (state.activeNode?.serverId === serverId && state.activeNode.sessionId === sessionId) {
     state.activeNode = null;
   }
-  persist();
   await refreshServer(serverId);
   showEmptyIfNeeded();
 }
@@ -389,14 +386,14 @@ $importFile.addEventListener('change', async () => {
   refreshAll();
   alert(`imported ${result.added} server(s); skipped ${result.skipped} duplicate(s)`);
 });
-$modalServer.addEventListener('click', (e) => {
-  const t = e.target as HTMLElement;
-  if (t.dataset.close !== undefined) $modalServer.close();
-});
-$modalNode.addEventListener('click', (e) => {
-  const t = e.target as HTMLElement;
-  if (t.dataset.close !== undefined) $modalNode.close();
-});
+$modalServer.addEventListener('click', closeOnBackdrop($modalServer));
+$modalNode.addEventListener('click', closeOnBackdrop($modalNode));
+
+function closeOnBackdrop(modal: HTMLDialogElement) {
+  return (e: MouseEvent) => {
+    if ((e.target as HTMLElement).dataset.close !== undefined) modal.close();
+  };
+}
 $formNode.addEventListener('submit', async (e) => {
   e.preventDefault();
   if (!nodeModalServerId) return;

@@ -414,10 +414,7 @@ function attach(ws: WebSocket, sessionId: string) {
 
     if (msg.type === 'attach') {
       if (attached) return;
-      attached = true;
       resizeSession(s, msg.cols, msg.rows);
-      // Lazy-revive: if session is dormant (e.g. restored from disk on boot),
-      // spawn `claude --resume <uuid>` now that someone wants it.
       try {
         ensureSpawned(s);
       } catch (err) {
@@ -426,8 +423,11 @@ function attach(ws: WebSocket, sessionId: string) {
           message: `failed to spawn claude: ${(err as Error).message}`,
         };
         ws.send(JSON.stringify(reply));
+        s.subscribers.delete(ws);
+        ws.close();
         return;
       }
+      attached = true;
       const reply: ServerMessage = {
         type: 'attached',
         session: toInfo(s),
@@ -443,7 +443,7 @@ function attach(ws: WebSocket, sessionId: string) {
     if (!attached) return;
 
     if (msg.type === 'input') {
-      if (s.alive && s.term) s.term.write(msg.data);
+      if (s.term) s.term.write(msg.data);
     } else if (msg.type === 'resize') {
       resizeSession(s, msg.cols, msg.rows);
     }

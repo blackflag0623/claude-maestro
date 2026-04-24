@@ -1,5 +1,14 @@
 import type { CreateSessionBody, SessionInfo } from '../shared/protocol';
 
+async function failure(r: Response, fallback: string): Promise<never> {
+  let detail = `${fallback} ${r.status}`;
+  try {
+    const j = await r.json();
+    if (j?.error) detail = j.error;
+  } catch {}
+  throw new Error(detail);
+}
+
 export class MaestroApi {
   readonly baseUrl: string;
 
@@ -21,13 +30,13 @@ export class MaestroApi {
 
   async health(): Promise<{ ok: boolean; sessions: number }> {
     const r = await fetch(this.url('/api/health'));
-    if (!r.ok) throw new Error(`health ${r.status}`);
+    if (!r.ok) await failure(r, 'health');
     return r.json();
   }
 
   async list(): Promise<SessionInfo[]> {
     const r = await fetch(this.url('/api/sessions'));
-    if (!r.ok) throw new Error(`list ${r.status}`);
+    if (!r.ok) await failure(r, 'list');
     return (await r.json()).sessions as SessionInfo[];
   }
 
@@ -37,14 +46,7 @@ export class MaestroApi {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    if (!r.ok) {
-      let detail = `${r.status}`;
-      try {
-        const j = await r.json();
-        if (j?.error) detail = j.error;
-      } catch {}
-      throw new Error(detail);
-    }
+    if (!r.ok) await failure(r, 'create');
     return (await r.json()).session as SessionInfo;
   }
 
@@ -52,12 +54,15 @@ export class MaestroApi {
     const r = await fetch(this.url(`/api/sessions/${encodeURIComponent(id)}`), {
       method: 'DELETE',
     });
-    if (!r.ok && r.status !== 404) throw new Error(`kill ${r.status}`);
+    if (!r.ok && r.status !== 404) await failure(r, 'kill');
   }
 
-  async completePath(prefix: string): Promise<{ base: string; entries: string[] }> {
-    const r = await fetch(this.url(`/api/fs/complete?prefix=${encodeURIComponent(prefix)}`));
-    if (!r.ok) throw new Error(`complete ${r.status}`);
+  async completePath(
+    prefix: string,
+    init?: RequestInit,
+  ): Promise<{ base: string; entries: string[] }> {
+    const r = await fetch(this.url(`/api/fs/complete?prefix=${encodeURIComponent(prefix)}`), init);
+    if (!r.ok) await failure(r, 'complete');
     return r.json();
   }
 }

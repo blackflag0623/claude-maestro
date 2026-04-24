@@ -36,13 +36,8 @@ export function loadState(): PersistedState {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return structuredClone(empty);
-    const parsed = JSON.parse(raw) as PersistedState;
-    return {
-      servers: parsed.servers ?? [],
-      activeNode: parsed.activeNode ?? null,
-      knownNodes: parsed.knownNodes ?? {},
-      lastCwd: parsed.lastCwd ?? {},
-    };
+    const parsed = JSON.parse(raw) as Partial<PersistedState>;
+    return { ...structuredClone(empty), ...parsed };
   } catch {
     return structuredClone(empty);
   }
