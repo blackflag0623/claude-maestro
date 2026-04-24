@@ -20,13 +20,21 @@ Tracks known limitations, upstream quirks, and platform restrictions affecting c
 
 ## Server (node-pty / shell auto-launch)
 
-_(none recorded yet)_
+### Sessions are in-memory only — restarting the server kills everything
+
+- **Symptom:** After `npm run dev` restart (server side), all previously-created nodes vanish; the client shows them as gone after the next refresh.
+- **Root cause:** `sessions: Map<id, Session>` lives in process memory. PTYs are children of the maestro process and die with it. No on-disk persistence.
+- **Workaround:** Treat server restarts as session-destructive. If durability across restarts is needed, persist `SessionInfo` + scrollback to disk and respawn PTYs on boot — non-trivial because the in-flight `claude` process state cannot be recovered.
 
 ---
 
 ## Protocol / WebSocket
 
-_(none recorded yet)_
+### CORS is wide-open; trust assumed at the network layer
+
+- **Symptom:** Any origin can hit `/api/*` and `/maestro-ws` if it can reach the host.
+- **Root cause:** The portal is intended for trusted LANs / dev machines and `Access-Control-Allow-Origin` is reflected from the request. There is no auth token, no CSRF protection, and no per-session ownership check.
+- **Workaround:** Bind the server to a private interface, or front it with a reverse proxy that adds auth. Do not expose `claude-maestro` directly to the public internet.
 
 ---
 

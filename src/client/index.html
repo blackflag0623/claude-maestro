@@ -1,22 +1,94 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>claude-maestro</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" />
-    <style>
-      html, body, #term {
-        margin: 0;
-        padding: 0;
-        width: 100vw;
-        height: 100vh;
-        background: #000;
-        overflow: hidden;
-      }
-    </style>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>maestro · claude</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,800&family=JetBrains+Mono:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230a0a0a'/><rect x='6' y='14' width='4' height='4' fill='%23c6ff3d'/></svg>" />
   </head>
   <body>
-    <div id="term"></div>
+    <div class="app">
+      <aside class="sidebar" aria-label="servers and nodes">
+        <div class="brand">
+          <span class="brand__prefix">claude /</span>
+          <span class="brand__mark">maestro</span>
+        </div>
+
+        <div class="sidebar__section">
+          <div class="sidebar__head">
+            <span class="sidebar__heading">servers</span>
+            <button class="btn btn--ghost" id="btn-add-server" title="add server">+ add</button>
+          </div>
+          <ul class="server-list" id="server-list"></ul>
+        </div>
+
+        <div class="sidebar__foot">
+          <span class="legend">esc · sidebar &nbsp; / &nbsp; ⌘k · new node</span>
+        </div>
+      </aside>
+
+      <section class="main">
+        <header class="topbar">
+          <div class="topbar__crumbs" id="crumbs">
+            <span class="crumb crumb--muted">no node selected</span>
+          </div>
+          <div class="topbar__status">
+            <span class="status" id="status" data-state="idle">
+              <span class="status__pulse" aria-hidden="true"></span>
+              <span class="status__label">idle</span>
+            </span>
+          </div>
+        </header>
+
+        <div class="stage" id="stage">
+          <div class="empty" id="empty">
+            <div class="empty__rule"></div>
+            <h1 class="empty__title">no node attached</h1>
+            <p class="empty__body">
+              add a maestro server, then create a node to launch a Claude Code instance inside it.
+            </p>
+            <div class="empty__rule"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Add-server modal -->
+    <dialog class="modal" id="modal-server">
+      <form method="dialog" class="modal__form" id="form-server">
+        <header class="modal__head">
+          <h2>add maestro server</h2>
+          <button type="button" class="modal__x" data-close aria-label="close">×</button>
+        </header>
+        <label class="field">
+          <span class="field__label">label</span>
+          <input name="name" required maxlength="40" placeholder="prod-east, lab, ..." />
+        </label>
+        <label class="field">
+          <span class="field__label">base url</span>
+          <input
+            name="baseUrl"
+            required
+            type="url"
+            placeholder="http://10.0.1.20:4050"
+            pattern="https?://.+"
+          />
+        </label>
+        <p class="field__hint" id="server-error"></p>
+        <footer class="modal__foot">
+          <button type="button" class="btn" data-close>cancel</button>
+          <button type="submit" class="btn btn--primary">add server</button>
+        </footer>
+      </form>
+    </dialog>
+
     <script type="module" src="./main.ts"></script>
   </body>
 </html>
