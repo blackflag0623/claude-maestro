@@ -37,7 +37,14 @@ export class MaestroApi {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    if (!r.ok) throw new Error(`create ${r.status}`);
+    if (!r.ok) {
+      let detail = `${r.status}`;
+      try {
+        const j = await r.json();
+        if (j?.error) detail = j.error;
+      } catch {}
+      throw new Error(detail);
+    }
     return (await r.json()).session as SessionInfo;
   }
 

@@ -91,7 +91,31 @@ function loadPersisted() {
 
 // ───────── helpers ─────────
 
-const CLAUDE_BIN = process.env.MAESTRO_CLAUDE_BIN ?? 'claude';
+const CLAUDE_BIN_RAW = process.env.MAESTRO_CLAUDE_BIN ?? 'claude';
+const CLAUDE_BIN = resolveClaudeBin(CLAUDE_BIN_RAW);
+
+function resolveClaudeBin(name: string): string {
+  // If the user gave an absolute or relative path that exists as-is, use it.
+  if (name.includes(path.sep) || name.includes('/')) {
+    return name;
+  }
+  // Walk PATH, trying common Windows extensions first on win32.
+  const exts =
+    process.platform === 'win32'
+      ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.toLowerCase())
+      : [''];
+  const dirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  for (const d of dirs) {
+    for (const ext of exts) {
+      const candidate = path.join(d, name + ext);
+      try {
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch {}
+    }
+  }
+  // Fall through: spawn will probably fail, but the user will see a clear error.
+  return name;
+}
 
 function toInfo(s: Session): SessionInfo {
   return {
@@ -130,6 +154,12 @@ function resizeSession(s: Session, cols: number, rows: number) {
   } catch {}
 }
 
+function expandHome(p: string): string {
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
 // ───────── PTY spawn ─────────
 
 /** Spawn `claude` with --session-id (new) or --resume (existing). */
@@ -139,15 +169,20 @@ function spawnClaude(s: Session, mode: 'new' | 'resume') {
       ? ['--session-id', s.id]
       : ['--resume', s.id];
 
-  // node-pty wants an absolute / on-PATH executable name; cross-platform
-  // resolution is delegated to the OS via shell-less spawn (uses PATH).
-  const term = pty.spawn(CLAUDE_BIN, args, {
-    name: 'xterm-256color',
-    cols: s.cols,
-    rows: s.rows,
-    cwd: s.cwd,
-    env: { ...process.env, MAESTRO_SESSION: s.id } as Record<string, string>,
-  });
+  let term: pty.IPty;
+  try {
+    term = pty.spawn(CLAUDE_BIN, args, {
+      name: 'xterm-256color',
+      cols: s.cols,
+      rows: s.rows,
+      cwd: s.cwd,
+      env: { ...process.env, MAESTRO_SESSION: s.id } as Record<string, string>,
+    });
+  } catch (err) {
+    const message = `failed to spawn ${CLAUDE_BIN}: ${(err as Error).message}`;
+    console.error(`[maestro] ${message}`);
+    throw new Error(message);
+  }
 
   s.term = term;
   s.alive = true;
@@ -180,7 +215,7 @@ function ensureSpawned(s: Session) {
 
 function createSession(body: CreateSessionBody): Session {
   const id = crypto.randomUUID();
-  const cwd = body.cwd?.trim() || os.homedir();
+  const cwd = body.cwd?.trim() ? expandHome(body.cwd.trim()) : os.homedir();
   if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
     throw new Error(`cwd does not exist or is not a directory: ${cwd}`);
   }
@@ -199,8 +234,13 @@ function createSession(body: CreateSessionBody): Session {
     subscribers: new Set(),
   };
   sessions.set(id, s);
+  try {
+    spawnClaude(s, 'new');
+  } catch (err) {
+    sessions.delete(id);
+    throw err;
+  }
   persist();
-  spawnClaude(s, 'new');
   return s;
 }
 
@@ -273,12 +313,6 @@ app.delete('/api/sessions/:id', (req, res) => {
 
 const FS_LIMIT = 50;
 const FS_EXCLUDE = new Set(['node_modules']);
-
-function expandHome(p: string): string {
-  if (p === '~') return os.homedir();
-  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
-  return p;
-}
 
 app.get('/api/fs/complete', (req, res) => {
   const raw = String(req.query.prefix ?? '').trim();
