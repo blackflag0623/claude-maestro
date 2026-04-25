@@ -172,10 +172,10 @@ function setActivity(s: Session, a: SessionActivity) {
 
 // ───────── hooks (per-session activity tracking) ─────────
 
-const HOOK_SCRIPT = path.join(STORE_DIR, 'hook.sh');
+const HOOK_SCRIPT = path.join(STORE_DIR, 'hook.mjs');
 const HOOK_SETTINGS = path.join(STORE_DIR, 'hooks.json');
 const HOOK_URL = `http://127.0.0.1:${PORT}/api/hook`;
-const HOOKS_ENABLED = process.platform !== 'win32';
+const NODE_BIN = process.execPath;
 
 const HOOK_ACTIVITY: Record<string, SessionActivity> = {
   UserPromptSubmit: 'working',
@@ -185,28 +185,43 @@ const HOOK_ACTIVITY: Record<string, SessionActivity> = {
   Stop: 'idle',
 };
 
+const quote = (s: string) => (/[\s"]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s);
+
 function ensureHookFiles() {
-  if (!HOOKS_ENABLED) return;
   try {
     fs.mkdirSync(STORE_DIR, { recursive: true });
-    const script = `#!/bin/sh
-# claude-maestro hook → POST event to local maestro for activity tracking.
-# Stream stdin straight to curl, fire-and-forget; never block claude.
-exec >/dev/null 2>&1
-curl -fsS --max-time 2 -X POST \\
-  -H 'content-type: application/json' \\
-  -H "x-maestro-event: $1" \\
-  --data-binary @- \\
-  "${HOOK_URL}" &
-exit 0
+    // Cross-platform hook: tiny Node script. Reads JSON from stdin, fires a
+    // POST to the maestro server, exits immediately. No shell dependency.
+    const script = `#!/usr/bin/env node
+import http from 'node:http';
+const event = process.argv[2] ?? '';
+let body = '';
+process.stdin.on('data', (c) => { body += c; });
+process.stdin.on('end', () => {
+  const req = http.request(${JSON.stringify(HOOK_URL)}, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
+      'x-maestro-event': event,
+    },
+    timeout: 2000,
+  });
+  req.on('error', () => process.exit(0));
+  req.on('response', () => process.exit(0));
+  req.on('timeout', () => { req.destroy(); process.exit(0); });
+  req.end(body);
+});
+process.stdin.on('error', () => process.exit(0));
 `;
     fs.writeFileSync(HOOK_SCRIPT, script);
-    fs.chmodSync(HOOK_SCRIPT, 0o755);
+    if (process.platform !== 'win32') fs.chmodSync(HOOK_SCRIPT, 0o755);
+    const command = `${quote(NODE_BIN)} ${quote(HOOK_SCRIPT)}`;
     const settings = {
       hooks: Object.fromEntries(
         Object.keys(HOOK_ACTIVITY).map((event) => [
           event,
-          [{ hooks: [{ type: 'command', command: `${HOOK_SCRIPT} ${event}` }] }],
+          [{ hooks: [{ type: 'command', command: `${command} ${event}` }] }],
         ]),
       ),
     };
@@ -224,7 +239,7 @@ function spawnClaude(s: Session, mode: 'new' | 'resume') {
     mode === 'new'
       ? ['--session-id', s.id]
       : ['--resume', s.id];
-  const hookArgs = HOOKS_ENABLED ? ['--settings', HOOK_SETTINGS] : [];
+  const hookArgs = ['--settings', HOOK_SETTINGS];
   const args = [...baseArgs, ...hookArgs];
 
   let term: pty.IPty;
