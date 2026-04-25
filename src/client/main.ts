@@ -163,13 +163,14 @@ function renderNodeRow(ref: NodeRef, info?: SessionInfo): HTMLLIElement {
   const local = nodes.get(nodeKey(ref.serverId, ref.sessionId));
   const localStatus = local?.status;
   const liveAlive = info?.alive ?? true;
+  const activity: SessionActivity = local?.activity ?? info?.activity ?? 'unknown';
   li.dataset.state = localStatus ?? (liveAlive ? 'connecting' : 'exited');
-  li.dataset.activity = local?.activity ?? info?.activity ?? 'unknown';
+  li.dataset.activity = activity;
 
   li.innerHTML = `
     <span class="node__bar"></span>
     <span class="node__title">${escapeHtml(ref.title)}</span>
-    <span class="node__activity" title="${escapeHtml(activityLabel(li.dataset.activity as SessionActivity))}"></span>
+    <span class="node__activity" title="${escapeHtml(activityLabel(activity))}"></span>
     <button class="node__kill" title="kill node" aria-label="kill">×</button>
   `;
   li.addEventListener('click', (e) => {

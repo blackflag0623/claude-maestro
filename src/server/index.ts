@@ -177,13 +177,13 @@ const HOOK_SETTINGS = path.join(STORE_DIR, 'hooks.json');
 const HOOK_URL = `http://127.0.0.1:${PORT}/api/hook`;
 const NODE_BIN = process.execPath;
 
-const HOOK_ACTIVITY: Record<string, SessionActivity> = {
+const HOOK_ACTIVITY = {
   UserPromptSubmit: 'working',
   PreToolUse: 'working',
   PostToolUse: 'working',
   Notification: 'waiting',
   Stop: 'idle',
-};
+} as const satisfies Record<string, SessionActivity>;
 
 const quote = (s: string) => (/[\s"]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s);
 // Hook commands are JSON-decoded by claude then passed to a shell. On Windows
@@ -196,8 +196,7 @@ function ensureHookFiles() {
     fs.mkdirSync(STORE_DIR, { recursive: true });
     // Cross-platform hook: tiny Node script. Reads JSON from stdin, fires a
     // POST to the maestro server, exits immediately. No shell dependency.
-    const script = `#!/usr/bin/env node
-import http from 'node:http';
+    const script = `import http from 'node:http';
 const event = process.argv[2] ?? '';
 let body = '';
 process.stdin.on('data', (c) => { body += c; });
@@ -393,7 +392,7 @@ app.delete('/api/sessions/:id', (req, res) => {
 app.post('/api/hook', (req, res) => {
   const event = String(req.headers['x-maestro-event'] ?? '');
   const sid = (req.body?.session_id as string | undefined) ?? '';
-  const next = HOOK_ACTIVITY[event];
+  const next = (HOOK_ACTIVITY as Record<string, SessionActivity>)[event];
   const s = sid ? sessions.get(sid) : undefined;
   if (s && next) setActivity(s, next);
   res.status(204).end();
