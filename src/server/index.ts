@@ -186,6 +186,10 @@ const HOOK_ACTIVITY: Record<string, SessionActivity> = {
 };
 
 const quote = (s: string) => (/[\s"]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s);
+// Hook commands are JSON-decoded by claude then passed to a shell. On Windows
+// the shell is often bash (Git Bash), which eats backslashes in unquoted
+// `\n`/`\v`/etc. — turn paths into forward slashes so they survive both shells.
+const shellPath = (p: string) => (process.platform === 'win32' ? p.replace(/\\/g, '/') : p);
 
 function ensureHookFiles() {
   try {
@@ -216,7 +220,7 @@ process.stdin.on('error', () => process.exit(0));
 `;
     fs.writeFileSync(HOOK_SCRIPT, script);
     if (process.platform !== 'win32') fs.chmodSync(HOOK_SCRIPT, 0o755);
-    const command = `${quote(NODE_BIN)} ${quote(HOOK_SCRIPT)}`;
+    const command = `${quote(shellPath(NODE_BIN))} ${quote(shellPath(HOOK_SCRIPT))}`;
     const settings = {
       hooks: Object.fromEntries(
         Object.keys(HOOK_ACTIVITY).map((event) => [
