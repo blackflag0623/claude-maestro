@@ -125,11 +125,14 @@ function renderServer(srv: ServerEntry): HTMLLIElement {
   const li = document.createElement('li');
   li.className = 'server';
   li.dataset.state = rt?.health ?? 'unknown';
+  li.dataset.serverId = srv.id;
+  li.draggable = true;
 
   const known = state.knownNodes[srv.id] ?? [];
 
   li.innerHTML = `
     <div class="server__row">
+      <span class="server__grip" title="drag to reorder" aria-hidden="true">⋮⋮</span>
       <span class="server__dot"></span>
       <span class="server__name">${escapeHtml(srv.name)}</span>
       <button class="icon-btn" data-act="refresh" title="refresh" aria-label="refresh">↻</button>
@@ -152,12 +155,17 @@ function renderServer(srv: ServerEntry): HTMLLIElement {
   li.querySelector('[data-act="refresh"]')!.addEventListener('click', () => refreshServer(srv.id));
   li.querySelector('[data-act="remove"]')!.addEventListener('click', () => removeServer(srv.id));
 
+  attachDrag(li, { kind: 'server', serverId: srv.id });
+
   return li;
 }
 
 function renderNodeRow(ref: NodeRef, info?: SessionInfo): HTMLLIElement {
   const li = document.createElement('li');
   li.className = 'node';
+  li.dataset.serverId = ref.serverId;
+  li.dataset.sessionId = ref.sessionId;
+  li.draggable = true;
   if (isActive(ref)) li.setAttribute('aria-current', 'true');
 
   const local = nodes.get(nodeKey(ref.serverId, ref.sessionId));
@@ -181,6 +189,7 @@ function renderNodeRow(ref: NodeRef, info?: SessionInfo): HTMLLIElement {
     e.stopPropagation();
     killNode(ref.serverId, ref.sessionId);
   });
+  attachDrag(li, { kind: 'node', serverId: ref.serverId, sessionId: ref.sessionId });
   return li;
 }
 
@@ -200,6 +209,89 @@ const HTML_ESCAPES: Record<string, string> = {
 };
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]!);
+}
+
+// ───────── drag-to-reorder ─────────
+
+type DragRef =
+  | { kind: 'server'; serverId: string }
+  | { kind: 'node'; serverId: string; sessionId: string };
+
+let dragging: DragRef | null = null;
+
+function attachDrag(el: HTMLElement, ref: DragRef) {
+  el.addEventListener('dragstart', (e) => {
+    dragging = ref;
+    el.classList.add('is-dragging');
+    e.dataTransfer?.setData('text/plain', JSON.stringify(ref));
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+  });
+  el.addEventListener('dragend', () => {
+    el.classList.remove('is-dragging');
+    document.querySelectorAll('.is-drop-target').forEach((n) => n.classList.remove('is-drop-target'));
+    dragging = null;
+  });
+  el.addEventListener('dragover', (e) => {
+    if (!dragging || dragging.kind !== ref.kind) return;
+    if (ref.kind === 'node' && dragging.kind === 'node' && dragging.serverId !== ref.serverId) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+    el.classList.add('is-drop-target');
+  });
+  el.addEventListener('dragleave', () => el.classList.remove('is-drop-target'));
+  el.addEventListener('drop', (e) => {
+    el.classList.remove('is-drop-target');
+    if (!dragging || dragging.kind !== ref.kind) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const before = isAbove(e, el);
+    if (dragging.kind === 'server' && ref.kind === 'server') {
+      reorderServer(dragging.serverId, ref.serverId, before);
+    } else if (dragging.kind === 'node' && ref.kind === 'node') {
+      if (dragging.serverId !== ref.serverId) return;
+      reorderNode(ref.serverId, dragging.sessionId, ref.sessionId, before);
+    }
+  });
+}
+
+function isAbove(e: DragEvent, el: HTMLElement): boolean {
+  const r = el.getBoundingClientRect();
+  return e.clientY < r.top + r.height / 2;
+}
+
+function moveWithin<T>(arr: T[], from: number, to: number): T[] {
+  if (from === to || from < 0 || to < 0 || from >= arr.length || to > arr.length) return arr;
+  const next = arr.slice();
+  const [item] = next.splice(from, 1);
+  next.splice(to > from ? to - 1 : to, 0, item!);
+  return next;
+}
+
+function reorderServer(draggedId: string, targetId: string, before: boolean) {
+  if (draggedId === targetId) return;
+  const from = state.servers.findIndex((s) => s.id === draggedId);
+  const targetIdx = state.servers.findIndex((s) => s.id === targetId);
+  if (from < 0 || targetIdx < 0) return;
+  const to = before ? targetIdx : targetIdx + 1;
+  const next = moveWithin(state.servers, from, to);
+  if (next === state.servers) return;
+  state.servers = next;
+  persist();
+  scheduleRender();
+}
+
+function reorderNode(serverId: string, draggedSid: string, targetSid: string, before: boolean) {
+  if (draggedSid === targetSid) return;
+  const list = state.knownNodes[serverId] ?? [];
+  const from = list.findIndex((n) => n.sessionId === draggedSid);
+  const targetIdx = list.findIndex((n) => n.sessionId === targetSid);
+  if (from < 0 || targetIdx < 0) return;
+  const to = before ? targetIdx : targetIdx + 1;
+  const next = moveWithin(list, from, to);
+  if (next === list) return;
+  state.knownNodes = { ...state.knownNodes, [serverId]: next };
+  persist();
+  scheduleRender();
 }
 
 function renderTopbar() {
