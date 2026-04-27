@@ -506,6 +506,32 @@ button { font: inherit; color: inherit; }
 .node-host .xterm-viewport,
 .node-host .xterm-screen { height: 100% !important; }
 .node-host .xterm-viewport { background: transparent !important; }
+/* Hide xterm's native cursor. The DOM renderer paints it as a span using
+   palette indices 256/257 (theme.cursor / cursorAccent). The Claude CLI
+   draws its own cursor in the output stream, so xterm's would distract. */
+.node-host .xterm-rows .xterm-bg-256,
+.node-host .xterm-rows .xterm-bg-257 {
+  background-color: transparent !important;
+  color: #e8e8e3 !important;
+}
+
+/* Ambient indicator in the terminal's top-right corner. Offset right=22px
+   to clear xterm's 15px scrollbar. See cursor-indicator.ts. */
+.chase-indicator {
+  position: absolute;
+  top: 6px;
+  right: 22px;
+  display: grid;
+  grid-template-columns: repeat(9, 3px);
+  grid-template-rows: repeat(9, 3px);
+  gap: 1px;
+  pointer-events: none;
+  z-index: 5;
+}
+.chase-indicator__cell {
+  background: #c6ff3d;
+  opacity: 0.06;
+}
 
 /* empty state */
 .empty {

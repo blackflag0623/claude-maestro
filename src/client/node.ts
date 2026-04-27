@@ -3,6 +3,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import type { ClientMessage, ServerMessage, SessionInfo, SessionActivity } from '../shared/protocol';
 import type { MaestroApi } from './api';
+import { buildCursorIndicator, type CursorIndicator } from './cursor-indicator';
 
 export type NodeStatus = 'connecting' | 'live' | 'reconnecting' | 'exited' | 'error';
 
@@ -28,6 +29,7 @@ export class TerminalNode {
   private resizeObserver: ResizeObserver | null = null;
   private _status: NodeStatus = 'connecting';
   private _activity: SessionActivity = 'unknown';
+  private readonly indicator: CursorIndicator;
   session: SessionInfo | null = null;
 
   constructor(
@@ -39,7 +41,9 @@ export class TerminalNode {
     this.el.className = 'node-host';
 
     this.term = new Terminal({
-      cursorBlink: true,
+      // Native cursor is hidden via CSS (see styles.css) so the Claude CLI's
+      // in-stream cursor is the sole input indicator.
+      cursorBlink: false,
       fontFamily: '"JetBrains Mono", Consolas, "Cascadia Mono", Menlo, monospace',
       fontSize: 13,
       lineHeight: 1.2,
@@ -48,8 +52,6 @@ export class TerminalNode {
       theme: {
         background: '#0a0a0a',
         foreground: '#e8e8e3',
-        cursor: '#c6ff3d',
-        cursorAccent: '#0a0a0a',
         selectionBackground: '#c6ff3d44',
         black: '#0a0a0a',
         brightBlack: '#3a3a3a',
@@ -71,6 +73,8 @@ export class TerminalNode {
     });
     this.term.loadAddon(this.fit);
     this.term.open(this.el);
+    this.indicator = buildCursorIndicator();
+    this.el.appendChild(this.indicator.el);
 
     // Ctrl/Cmd+V → fetch from clipboard and send as input.
     // Ctrl/Cmd+C with selection → copy. (See KNOWN_ISSUES.md)
@@ -155,6 +159,7 @@ export class TerminalNode {
       this.reconnectTimer = null;
     }
     this.resizeObserver?.disconnect();
+    this.indicator.stop();
     try {
       this.ws?.close();
     } catch {}
@@ -234,3 +239,4 @@ export class TerminalNode {
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, 5000);
   }
 }
+
