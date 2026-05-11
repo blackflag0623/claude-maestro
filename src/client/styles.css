@@ -568,6 +568,18 @@ button { font: inherit; color: inherit; }
   background-color: #c6ff3d !important;
   color: #0a0a0a !important;
 }
+/* Suppress xterm's own cursor element. Claude already draws its cursor inline
+   (see rule above); xterm's native cursor only appears once the terminal has
+   focus, producing a second blinking cursor on top of Claude's. Hide the
+   cursor layer (canvas renderer) and neutralize the cursor span (DOM
+   renderer) so the inline lime block is the sole indicator. */
+.node-host .xterm-cursor-layer { display: none !important; }
+.node-host .xterm-rows .xterm-cursor {
+  background-color: transparent !important;
+  color: inherit !important;
+  border-color: transparent !important;
+  outline-color: transparent !important;
+}
 
 /* Ambient indicator in the terminal's top-right corner. Offset right=22px
    to clear xterm's 15px scrollbar. See cursor-indicator.ts. */
