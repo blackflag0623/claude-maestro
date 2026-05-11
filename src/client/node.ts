@@ -76,15 +76,30 @@ export class TerminalNode {
     this.indicator = buildCursorIndicator();
     this.el.appendChild(this.indicator.el);
 
-    // Ctrl/Cmd+V → fetch from clipboard and send as input.
-    // Ctrl/Cmd+C with selection → copy. (See KNOWN_ISSUES.md)
+    // Ctrl/Cmd+V → fetch from clipboard and paste via xterm. Going through
+    // term.paste(): (a) normalizes \r\n → \r so newlines arrive as Enter keys,
+    // (b) wraps text in bracketed-paste escapes (\e[200~…\e[201~) when the
+    // TUI enabled them — without this, Claude's TUI sees the first \n as
+    // Enter and submits the prompt, truncating the remainder. Pasted text
+    // exits via the standard onData listener below. (See KNOWN_ISSUES.md)
+    // Ctrl/Cmd+C with selection → copy.
     this.term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true;
       const ctrl = e.ctrlKey || e.metaKey;
       if (ctrl && e.key.toLowerCase() === 'v') {
         navigator.clipboard
           .readText()
-          .then((text) => text && this.send({ type: 'input', data: text }))
+          .then((text) => {
+            if (!text) return;
+            // Wrap clipboard content as a bracketed paste so Claude's TUI
+            // treats it as one atomic input. Without the markers, every
+            // embedded \n is read as Enter and the prompt submits partway,
+            // discarding the remainder. xterm's term.paste() won't add the
+            // markers unless it observed \e[?2004h on the wire, so wrap
+            // manually. Normalize \r\n → \n inside the span.
+            const normalized = text.replace(/\r\n?/g, '\n');
+            this.send({ type: 'input', data: `\x1b[200~${normalized}\x1b[201~` });
+          })
           .catch(() => {});
         return false;
       }

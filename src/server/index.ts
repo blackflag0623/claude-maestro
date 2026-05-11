@@ -158,6 +158,30 @@ function resizeSession(s: Session, cols: number, rows: number) {
   } catch {}
 }
 
+// Writes >1KB (typically paste events) are split into chunks and dispatched
+// across libuv ticks. ConPTY on Windows has a small kernel pipe buffer; one
+// large write can outrun the TUI's reader and drop bytes in the middle. The
+// chunk size is small enough to fit comfortably in any PTY buffer, and
+// setImmediate between chunks lets node-pty drain before the next write.
+// Keystroke-sized inputs (the common case) take the synchronous fast path.
+const PTY_WRITE_CHUNK = 1024;
+
+function writeToPty(s: Session, data: string) {
+  if (!s.term || data.length === 0) return;
+  if (data.length <= PTY_WRITE_CHUNK) {
+    s.term.write(data);
+    return;
+  }
+  let i = 0;
+  const writeNext = () => {
+    if (!s.term || i >= data.length) return;
+    s.term.write(data.slice(i, i + PTY_WRITE_CHUNK));
+    i += PTY_WRITE_CHUNK;
+    if (i < data.length) setImmediate(writeNext);
+  };
+  writeNext();
+}
+
 function expandHome(p: string): string {
   if (p === '~') return os.homedir();
   if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
@@ -532,7 +556,7 @@ function attach(ws: WebSocket, sessionId: string) {
     if (!attached) return;
 
     if (msg.type === 'input') {
-      if (s.term) s.term.write(msg.data);
+      writeToPty(s, msg.data);
     } else if (msg.type === 'resize') {
       resizeSession(s, msg.cols, msg.rows);
     }
