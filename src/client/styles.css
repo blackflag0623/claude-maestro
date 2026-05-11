@@ -70,9 +70,26 @@ button { font: inherit; color: inherit; }
 
 .app {
   display: grid;
-  grid-template-columns: 232px 1fr;
+  grid-template-columns: var(--sidebar-w, 232px) 1fr;
   height: 100vh;
+  transition: grid-template-columns 220ms cubic-bezier(.7, .1, .2, 1);
 }
+.app[data-sidebar="collapsed"] { --sidebar-w: 0px; }
+.app[data-sidebar="collapsed"] .sidebar {
+  /* Remove from tab order + pointer hits while the wipe completes.
+     Visibility transitions with a 220ms delay so it hides at the end of
+     the column-shrink, and shows instantly on expand. */
+  visibility: hidden;
+  pointer-events: none;
+  transition: visibility 0s linear 220ms;
+}
+.app[data-sidebar="expanded"] .sidebar {
+  visibility: visible;
+  transition: visibility 0s linear 0s;
+}
+/* Prevent the animation from firing on initial paint. */
+.app[data-boot="1"] { transition: none; }
+.app[data-boot="1"] .sidebar { transition: none; }
 
 /* ───────── sidebar ───────── */
 
@@ -84,6 +101,8 @@ button { font: inherit; color: inherit; }
   background-image: var(--grain);
   background-blend-mode: multiply;
   position: relative;
+  overflow: hidden;
+  min-width: 0;
 }
 
 .brand {
@@ -404,7 +423,36 @@ button { font: inherit; color: inherit; }
   background-image: var(--grain);
   background-blend-mode: multiply;
   min-height: 36px;
+  gap: 10px;
 }
+
+/* ───── sidebar toggle ───── */
+.sidebar-toggle {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bone-2);
+  border: 1.5px solid var(--ink);
+  cursor: pointer;
+  padding: 0;
+  color: var(--ink);
+  line-height: 1;
+  transition: background 80ms linear, color 80ms linear, transform 60ms ease;
+}
+.sidebar-toggle:hover { background: var(--ink); color: var(--lime); }
+.sidebar-toggle:active { transform: translate(1px, 1px); }
+.sidebar-toggle__icon {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;
+  transition: transform 220ms cubic-bezier(.7, .1, .2, 1);
+}
+.app[data-sidebar="collapsed"] .sidebar-toggle__icon { transform: rotate(180deg); }
 
 .crumb {
   font-size: 10.5px;
@@ -498,8 +546,14 @@ button { font: inherit; color: inherit; }
   color: rgba(236,231,221,0.4);
 }
 
+/* node-host fills its pane body. In single-pane mode we use a slightly
+   larger inset to give the corner marks room to breathe; multi-pane mode
+   uses a tighter inset since each pane has its own chrome. */
 .node-host {
   position: absolute;
+  inset: 8px 8px 12px;
+}
+.stage[data-layout="single"] .pane__body .node-host {
   inset: 12px 12px 18px;
 }
 .node-host .xterm,
@@ -816,4 +870,278 @@ button { font: inherit; color: inherit; }
   color: var(--lime);
 }
 
-/* ───────── scrollbar ───────── */
+/* ───────── scrollbar ─────────
+   Brutalist scrollbars: flat, hard-edged, no rounding. Two variants:
+   - light surfaces (sidebar, modal, path-picker) → ink-on-bone
+   - dark surfaces (xterm viewport, terminal panes) → lime-on-ink
+   Firefox: `scrollbar-width: thin` + `scrollbar-color: thumb track`.
+   WebKit/Chromium: `::-webkit-scrollbar*` rules below. */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--ink) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+  background: transparent;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+  border-left: 1px solid rgba(10, 10, 10, 0.12);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--ink);
+  border: 2px solid var(--bone);
+  /* No border-radius — brutalist hard edges. */
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ink-2);
+}
+::-webkit-scrollbar-thumb:active {
+  background: var(--lime);
+}
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* Dark-surface variant for the terminal viewport and any future dark
+   scrollable region inside a pane. xterm renders its scrollbar inside
+   `.xterm-viewport` (overflow-y: scroll). */
+.node-host .xterm-viewport,
+.pane__body {
+  scrollbar-color: var(--lime) #0a0a0a;
+}
+.node-host .xterm-viewport::-webkit-scrollbar,
+.pane__body::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+  background: #0a0a0a;
+}
+.node-host .xterm-viewport::-webkit-scrollbar-track,
+.pane__body::-webkit-scrollbar-track {
+  background: #0a0a0a;
+  border-left: 1px solid rgba(236, 231, 221, 0.08);
+}
+.node-host .xterm-viewport::-webkit-scrollbar-thumb,
+.pane__body::-webkit-scrollbar-thumb {
+  background: rgba(236, 231, 221, 0.22);
+  border: 2px solid #0a0a0a;
+}
+.node-host .xterm-viewport::-webkit-scrollbar-thumb:hover,
+.pane__body::-webkit-scrollbar-thumb:hover {
+  background: rgba(236, 231, 221, 0.4);
+}
+.node-host .xterm-viewport::-webkit-scrollbar-thumb:active,
+.pane__body::-webkit-scrollbar-thumb:active {
+  background: var(--lime);
+}
+
+/* Keep the sidebar's node list flush — its scrollbar is hidden on purpose. */
+.sidebar__section { scrollbar-width: none; }
+.sidebar__section::-webkit-scrollbar { display: none; }
+
+/* ───────── panes (multi-terminal layout) ───────── */
+
+.panes {
+  position: absolute;
+  inset: 12px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+}
+.stage[data-layout="single"] .panes {
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+  /* In single mode the pane has no chrome; let it fill flush with the stage
+     so the legacy aesthetic (corner marks frame the terminal) is preserved. */
+  inset: 0;
+  gap: 0;
+}
+.stage[data-layout="split-2"] .panes {
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr;
+}
+.stage[data-layout="grid-4"] .panes {
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+.panes.is-hidden { display: none; }
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border: 1.5px solid rgba(236, 231, 221, 0.18);
+  background: #0a0a0a;
+  position: relative;
+  transition: border-color 100ms linear, box-shadow 100ms linear;
+}
+.stage[data-layout="single"] .pane { border-color: transparent; }
+.pane[aria-current="true"] {
+  border-color: var(--lime);
+  box-shadow: 0 0 0 1px rgba(198, 255, 61, 0.35);
+}
+.pane.is-drop-target {
+  border-color: var(--lime);
+  background: rgba(198, 255, 61, 0.06);
+  box-shadow: inset 0 0 0 2px var(--lime);
+}
+
+.pane__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 4px 8px;
+  background: rgba(236, 231, 221, 0.04);
+  border-bottom: 1px solid rgba(236, 231, 221, 0.12);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgba(236, 231, 221, 0.55);
+  user-select: none;
+  cursor: pointer;
+  flex-shrink: 0;
+  min-height: 22px;
+}
+.pane[aria-current="true"] .pane__head {
+  color: var(--lime);
+  background: rgba(198, 255, 61, 0.08);
+  border-bottom-color: rgba(198, 255, 61, 0.4);
+}
+.stage[data-layout="single"] .pane__head { display: none; }
+
+.pane__bar {
+  width: 4px;
+  height: 10px;
+  background: rgba(236, 231, 221, 0.3);
+  flex-shrink: 0;
+}
+.pane[data-state="live"] .pane__bar { background: var(--lime); }
+.pane[data-state="connecting"] .pane__bar,
+.pane[data-state="reconnecting"] .pane__bar {
+  background: var(--warn);
+  animation: blink 800ms steps(2, end) infinite;
+}
+.pane[data-state="exited"] .pane__bar,
+.pane[data-state="error"] .pane__bar { background: var(--err); }
+.pane[data-state="empty"] .pane__bar { background: rgba(236, 231, 221, 0.18); }
+
+.pane__slot-num {
+  font-family: var(--serif);
+  font-style: italic;
+  font-weight: 800;
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: inherit;
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+.pane__label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pane__activity {
+  width: 6px;
+  height: 6px;
+  border: 1px solid currentColor;
+  opacity: 0.4;
+  flex-shrink: 0;
+}
+.pane[data-activity="working"] .pane__activity {
+  background: var(--lime);
+  border-color: var(--lime);
+  opacity: 1;
+}
+.pane[data-activity="waiting"] .pane__activity {
+  background: var(--warn);
+  border-color: var(--warn);
+  opacity: 1;
+  animation: idle-pulse 1.4s ease-in-out infinite;
+}
+.pane[data-activity="idle"] .pane__activity {
+  background: var(--sky);
+  border-color: var(--sky);
+  opacity: 1;
+  animation: idle-pulse 1.4s ease-in-out infinite;
+}
+.pane__close {
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  color: inherit;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 4px;
+  opacity: 0.5;
+  flex-shrink: 0;
+}
+.pane__close:hover { opacity: 1; color: var(--err); }
+
+.pane__body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.pane__body.is-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(236, 231, 221, 0.32);
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  padding: 16px;
+  text-align: center;
+}
+.pane__body .pane__hint {
+  max-width: 220px;
+  line-height: 1.6;
+}
+.pane[aria-current="true"] .pane__body.is-empty {
+  color: rgba(198, 255, 61, 0.55);
+}
+
+/* ───────── layout switch ───────── */
+
+.topbar {
+  /* allow the center group to sit between crumbs and status */
+  gap: 12px;
+}
+.topbar__center {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.layout-switch {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1.5px solid var(--ink);
+  background: var(--bone-2);
+}
+.layout-switch button {
+  background: transparent;
+  border: 0;
+  padding: 3px 7px;
+  cursor: pointer;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-right: 1px solid var(--ink);
+  transition: background 80ms linear, color 80ms linear;
+}
+.layout-switch button:last-child { border-right: 0; }
+.layout-switch button:hover { color: var(--ink); background: var(--bone); }
+.layout-switch button[aria-current="true"] {
+  background: var(--ink);
+  color: var(--lime);
+}

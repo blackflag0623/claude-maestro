@@ -8,6 +8,9 @@ import {
   reconcileNodes,
   saveState,
   uuid,
+  PANE_COUNT,
+  MAX_PANES,
+  type LayoutMode,
   type NodeRef,
   type PersistedState,
   type ServerEntry,
@@ -29,8 +32,26 @@ const nodes = new Map<string, TerminalNode>(); // key from `nodeKey`
 
 const nodeKey = (serverId: string, sessionId: string) => `${serverId}::${sessionId}`;
 
-const isActive = (ref: NodeRef): boolean =>
-  state.activeNode?.serverId === ref.serverId && state.activeNode?.sessionId === ref.sessionId;
+/** A NodeRef is "active" if it occupies any visible pane in the current layout. */
+const isActive = (ref: NodeRef): boolean => {
+  const count = PANE_COUNT[state.layoutMode];
+  for (let i = 0; i < count; i++) {
+    const a = state.activeNodes[i];
+    if (a && a.serverId === ref.serverId && a.sessionId === ref.sessionId) return true;
+  }
+  return false;
+};
+
+/** Returns the slot index that currently hosts the given ref, or -1.
+ *  Searches all MAX_PANES slots (including stashed slots beyond the visible
+ *  range) so we can detect duplicates across layout changes. */
+function findSlotOf(ref: NodeRef): number {
+  for (let i = 0; i < MAX_PANES; i++) {
+    const a = state.activeNodes[i];
+    if (a && a.serverId === ref.serverId && a.sessionId === ref.sessionId) return i;
+  }
+  return -1;
+}
 
 function runtimeFor(serverId: string): ServerRuntime {
   let rt = servers.get(serverId);
@@ -46,7 +67,10 @@ const $serverList = document.getElementById('server-list') as HTMLUListElement;
 const $crumbs = document.getElementById('crumbs') as HTMLDivElement;
 const $status = document.getElementById('status') as HTMLSpanElement;
 const $stage = document.getElementById('stage') as HTMLDivElement;
+const $panes = document.getElementById('panes') as HTMLDivElement;
 const $empty = document.getElementById('empty') as HTMLDivElement;
+const $layoutSwitch = document.getElementById('layout-switch') as HTMLDivElement;
+const $btnSidebar = document.getElementById('btn-sidebar') as HTMLButtonElement;
 const $btnAddServer = document.getElementById('btn-add-server') as HTMLButtonElement;
 const $btnExport = document.getElementById('btn-export') as HTMLButtonElement;
 const $btnImport = document.getElementById('btn-import') as HTMLButtonElement;
@@ -75,6 +99,7 @@ function scheduleRender() {
     renderTopbar();
     renderHud();
     renderStageTag();
+    renderPaneStates();
   });
 }
 
@@ -87,10 +112,12 @@ function renderHud() {
 
 function renderStageTag() {
   if (!$stageTag) return;
-  const a = state.activeNode;
-  $stageTag.textContent = a
-    ? `stage / ${a.title} · ${a.sessionId.slice(0, 8)}`
-    : 'stage / channel-01';
+  const a = state.activeNodes[state.focusedPane];
+  if (a) {
+    $stageTag.textContent = `stage / ${a.title} · ${a.sessionId.slice(0, 8)}`;
+  } else {
+    $stageTag.textContent = `stage / ${state.layoutMode}`;
+  }
 }
 
 function pad2(n: number) {
@@ -295,9 +322,17 @@ function reorderNode(serverId: string, draggedSid: string, targetSid: string, be
 }
 
 function renderTopbar() {
-  const active = state.activeNode;
+  const active = state.activeNodes[state.focusedPane];
+  for (const btn of $layoutSwitch.querySelectorAll<HTMLButtonElement>('button[data-mode]')) {
+    const isCurrent = btn.dataset.mode === state.layoutMode;
+    if (isCurrent) btn.setAttribute('aria-current', 'true');
+    else btn.removeAttribute('aria-current');
+  }
   if (!active) {
-    $crumbs.innerHTML = `<span class="crumb crumb--muted">no node selected</span>`;
+    const count = PANE_COUNT[state.layoutMode];
+    const label =
+      count === 1 ? 'no node selected' : `slot ${state.focusedPane + 1} · empty`;
+    $crumbs.innerHTML = `<span class="crumb crumb--muted">${escapeHtml(label)}</span>`;
     setStatus('idle');
     return;
   }
@@ -356,11 +391,11 @@ function removeServer(serverId: string) {
   }
   state.servers = state.servers.filter((s) => s.id !== serverId);
   delete state.knownNodes[serverId];
-  if (state.activeNode?.serverId === serverId) state.activeNode = null;
+  state.activeNodes = state.activeNodes.map((a) => (a && a.serverId === serverId ? null : a));
   servers.delete(serverId);
   persist();
+  renderPanes();
   scheduleRender();
-  showEmptyIfNeeded();
 }
 
 async function createNode(serverId: string, body: { title?: string; cwd: string }) {
@@ -404,55 +439,292 @@ async function killNode(serverId: string, sessionId: string) {
   state.knownNodes[serverId] = (state.knownNodes[serverId] ?? []).filter(
     (n) => n.sessionId !== sessionId,
   );
-  if (state.activeNode?.serverId === serverId && state.activeNode.sessionId === sessionId) {
-    state.activeNode = null;
-  }
+  state.activeNodes = state.activeNodes.map((a) =>
+    a && a.serverId === serverId && a.sessionId === sessionId ? null : a,
+  );
   await refreshServer(serverId);
-  showEmptyIfNeeded();
-}
-
-function selectNode(ref: NodeRef) {
-  if (state.activeNode) {
-    nodes.get(nodeKey(state.activeNode.serverId, state.activeNode.sessionId))?.unmount();
-  }
-  state.activeNode = ref;
-  persist();
-
-  const key = nodeKey(ref.serverId, ref.sessionId);
-  let node = nodes.get(key);
-  if (!node) {
-    node = new TerminalNode(runtimeFor(ref.serverId).api, ref.sessionId, {
-      status: (s) => {
-        if (isActive(ref)) setStatus(s);
-        scheduleRender();
-      },
-      activity: () => {
-        scheduleRender();
-      },
-      title: (t) => {
-        ref.title = t;
-        const list = state.knownNodes[ref.serverId];
-        const found = list?.find((n) => n.sessionId === ref.sessionId);
-        if (found) found.title = t;
-        persist();
-        scheduleRender();
-      },
-    });
-    nodes.set(key, node);
-  }
-  $empty.classList.add('is-hidden');
-  node.mount($stage);
+  renderPanes();
   scheduleRender();
 }
 
-function showEmptyIfNeeded() {
-  if (!state.activeNode) $empty.classList.remove('is-hidden');
+// ───── pane / layout management ─────
+
+function getOrCreateNode(ref: NodeRef): TerminalNode {
+  const key = nodeKey(ref.serverId, ref.sessionId);
+  let node = nodes.get(key);
+  if (node) return node;
+  node = new TerminalNode(runtimeFor(ref.serverId).api, ref.sessionId, {
+    status: () => {
+      // Status changes may affect topbar (focused pane) and pane head bars.
+      scheduleRender();
+    },
+    activity: () => {
+      scheduleRender();
+    },
+    title: (t) => {
+      ref.title = t;
+      const list = state.knownNodes[ref.serverId];
+      const found = list?.find((n) => n.sessionId === ref.sessionId);
+      if (found) found.title = t;
+      for (const a of state.activeNodes) {
+        if (a && a.serverId === ref.serverId && a.sessionId === ref.sessionId) a.title = t;
+      }
+      persist();
+      scheduleRender();
+    },
+  });
+  nodes.set(key, node);
+  return node;
+}
+
+/** Returns the .pane__body element for the given slot index, or null. */
+function paneBody(slot: number): HTMLElement | null {
+  const pane = $panes.children[slot] as HTMLElement | undefined;
+  return (pane?.querySelector('.pane__body') as HTMLElement | null) ?? null;
+}
+
+/** Build all panes for the current layout from scratch. Idempotent w.r.t.
+ *  TerminalNode lifetimes — nodes are unmounted from their current parent then
+ *  mounted into the new pane body. xterm + WS keep running across this. */
+function renderPanes() {
+  $stage.dataset.layout = state.layoutMode;
+  const count = PANE_COUNT[state.layoutMode];
+
+  // Unmount every currently-mounted node, then rebuild pane DOM. xterm + WS
+  // keep running across unmount/mount, so this is cheap from the user's POV.
+  for (const node of nodes.values()) {
+    if (node.el.parentElement) node.unmount();
+  }
+
+  $panes.innerHTML = '';
+  for (let i = 0; i < count; i++) {
+    $panes.appendChild(buildPane(i));
+  }
+
+  // Mount desired nodes into their pane bodies.
+  for (let i = 0; i < count; i++) {
+    const ref = state.activeNodes[i];
+    if (!ref) continue;
+    const body = paneBody(i);
+    if (!body) continue;
+    body.classList.remove('is-empty');
+    body.innerHTML = '';
+    const node = getOrCreateNode(ref);
+    node.mount(body);
+  }
+
+  refreshFocusedPaneFocus();
+  updateEmptyHero();
+}
+
+function buildPane(slot: number): HTMLElement {
+  const ref = state.activeNodes[slot];
+  const pane = document.createElement('div');
+  pane.className = 'pane';
+  pane.dataset.slot = String(slot);
+  if (slot === state.focusedPane) pane.setAttribute('aria-current', 'true');
+
+  const node = ref ? nodes.get(nodeKey(ref.serverId, ref.sessionId)) : null;
+  pane.dataset.state = node?.status ?? (ref ? 'connecting' : 'empty');
+  pane.dataset.activity = node?.activity ?? 'unknown';
+
+  const title = ref ? ref.title : 'empty slot';
+  pane.innerHTML = `
+    <header class="pane__head">
+      <span class="pane__bar"></span>
+      <span class="pane__slot-num">${slot + 1}</span>
+      <span class="pane__label">${escapeHtml(title)}</span>
+      <span class="pane__activity"></span>
+      ${ref ? `<button class="pane__close" type="button" title="detach (keeps session alive)" aria-label="detach">\u00d7</button>` : ''}
+    </header>
+    <div class="pane__body${ref ? '' : ' is-empty'}">${
+      ref ? '' : '<span class="pane__hint">empty — pick a node from the sidebar, or drop one here</span>'
+    }</div>
+  `;
+
+  pane.addEventListener('mousedown', (e) => {
+    if ((e.target as HTMLElement).closest('.pane__close')) return;
+    if (slot !== state.focusedPane) focusPane(slot);
+  });
+  if (ref) {
+    pane.querySelector('.pane__close')!.addEventListener('click', (e) => {
+      e.stopPropagation();
+      detachSlot(slot);
+    });
+  }
+
+  // Accept drag-drop of a sidebar node onto this pane.
+  pane.addEventListener('dragover', (e) => {
+    if (!dragging || dragging.kind !== 'node') return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+    pane.classList.add('is-drop-target');
+  });
+  pane.addEventListener('dragleave', (e) => {
+    const next = e.relatedTarget as Node | null;
+    if (next && pane.contains(next)) return;
+    pane.classList.remove('is-drop-target');
+  });
+  pane.addEventListener('drop', (e) => {
+    pane.classList.remove('is-drop-target');
+    if (!dragging || dragging.kind !== 'node') return;
+    e.preventDefault();
+    e.stopPropagation();
+    const list = state.knownNodes[dragging.serverId];
+    const dropped = list?.find((n) => n.sessionId === dragging!.sessionId);
+    if (!dropped) return;
+    placeInSlot(slot, dropped);
+  });
+
+  return pane;
+}
+
+/** Lightweight refresh of pane head data attributes + labels without rebuilding
+ *  the pane DOM (which would tear down mounted terminals). */
+function renderPaneStates() {
+  const count = PANE_COUNT[state.layoutMode];
+  for (let i = 0; i < count; i++) {
+    const paneEl = $panes.children[i] as HTMLElement | undefined;
+    if (!paneEl) continue;
+    const ref = state.activeNodes[i];
+    const node = ref ? nodes.get(nodeKey(ref.serverId, ref.sessionId)) : null;
+    paneEl.dataset.state = node?.status ?? (ref ? 'connecting' : 'empty');
+    paneEl.dataset.activity = node?.activity ?? 'unknown';
+    if (i === state.focusedPane) paneEl.setAttribute('aria-current', 'true');
+    else paneEl.removeAttribute('aria-current');
+    const label = paneEl.querySelector('.pane__label');
+    if (label) label.textContent = ref ? ref.title : 'empty slot';
+  }
+}
+
+function updateEmptyHero() {
+  const anyFilled = state.activeNodes.some((n) => !!n);
+  const showHero = state.layoutMode === 'single' && !anyFilled;
+  $empty.classList.toggle('is-hidden', !showHero);
+}
+
+function refreshFocusedPaneFocus() {
+  const ref = state.activeNodes[state.focusedPane];
+  if (!ref) return;
+  const node = nodes.get(nodeKey(ref.serverId, ref.sessionId));
+  if (node) requestAnimationFrame(() => node.term.focus());
+}
+
+function setLayoutMode(mode: LayoutMode) {
+  if (state.layoutMode === mode) return;
+  state.layoutMode = mode;
+  if (state.focusedPane >= PANE_COUNT[mode]) state.focusedPane = 0;
+  persist();
+  renderPanes();
+  scheduleRender();
+}
+
+/** Place `ref` into pane `slot`. If `ref` already occupies a different slot,
+ *  swap the contents (avoids ever having the same TerminalNode in two slots).
+ *  Always focuses `slot` after the move. */
+function placeInSlot(slot: number, ref: NodeRef) {
+  if (slot < 0 || slot >= PANE_COUNT[state.layoutMode]) return;
+  const existing = findSlotOf(ref);
+  if (existing === slot) {
+    focusPane(slot);
+    return;
+  }
+  const next = state.activeNodes.slice();
+  const displaced = next[slot] ?? null;
+  next[slot] = ref;
+  if (existing >= 0) {
+    next[existing] = displaced; // swap
+  }
+  state.activeNodes = next;
+  state.focusedPane = slot;
+  persist();
+  renderPanes();
+  scheduleRender();
+}
+
+function detachSlot(slot: number) {
+  if (!state.activeNodes[slot]) return;
+  const next = state.activeNodes.slice();
+  next[slot] = null;
+  state.activeNodes = next;
+  persist();
+  renderPanes();
+  scheduleRender();
+}
+
+function focusPane(slot: number) {
+  if (slot < 0 || slot >= PANE_COUNT[state.layoutMode]) return;
+  if (slot === state.focusedPane) {
+    refreshFocusedPaneFocus();
+    return;
+  }
+  state.focusedPane = slot;
+  persist();
+  for (let i = 0; i < $panes.children.length; i++) {
+    const p = $panes.children[i] as HTMLElement;
+    if (i === slot) p.setAttribute('aria-current', 'true');
+    else p.removeAttribute('aria-current');
+  }
+  refreshFocusedPaneFocus();
+  scheduleRender();
+}
+
+function selectNode(ref: NodeRef) {
+  // Clicking a sidebar node: if it's already mounted, focus that slot;
+  // otherwise mount it into the focused pane (replacing whatever was there).
+  const existing = findSlotOf(ref);
+  const visible = PANE_COUNT[state.layoutMode];
+  if (existing >= 0 && existing < visible) {
+    focusPane(existing);
+    return;
+  }
+  placeInSlot(state.focusedPane, ref);
 }
 
 $btnAddServer.addEventListener('click', () => {
   $serverError.textContent = '';
   $formServer.reset();
   $modalServer.showModal();
+});
+
+const $app = document.querySelector('.app') as HTMLElement;
+
+function applySidebarState() {
+  const collapsed = state.sidebarCollapsed;
+  $app.dataset.sidebar = collapsed ? 'collapsed' : 'expanded';
+  $btnSidebar.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  $btnSidebar.title = collapsed ? 'show sidebar (⌘B)' : 'hide sidebar (⌘B)';
+}
+
+function toggleSidebar() {
+  state.sidebarCollapsed = !state.sidebarCollapsed;
+  persist();
+  applySidebarState();
+}
+
+$btnSidebar.addEventListener('click', toggleSidebar);
+
+// ⌘/Ctrl+B toggles the sidebar globally. Intercept in capture phase so xterm
+// doesn't swallow the keypress before we see it. Ignored while a modal dialog
+// is open so the shortcut can't fire from inside a form input.
+document.addEventListener(
+  'keydown',
+  (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
+    if (e.key.toLowerCase() !== 'b') return;
+    if (document.querySelector('dialog[open]')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    toggleSidebar();
+  },
+  true,
+);
+
+$layoutSwitch.addEventListener('click', (e) => {
+  const btn = (e.target as HTMLElement).closest('button[data-mode]') as HTMLButtonElement | null;
+  if (!btn) return;
+  const mode = btn.dataset.mode as LayoutMode | undefined;
+  if (mode && mode in PANE_COUNT) setLayoutMode(mode);
 });
 
 $btnExport.addEventListener('click', () => {
@@ -543,15 +815,16 @@ if (state.servers.length === 0) {
   persist();
 }
 
-// Reattach the previously-active node so reload restores the working session.
-if (state.activeNode) {
-  const ref = state.activeNode;
-  state.activeNode = null;
-  selectNode(ref);
+applySidebarState();
+
+// Reattach previously-active nodes so reload restores the working layout.
+// Eagerly construct TerminalNodes for assigned slots so their WS kicks in.
+for (const ref of state.activeNodes) {
+  if (ref) getOrCreateNode(ref);
 }
+renderPanes();
 
 scheduleRender();
-showEmptyIfNeeded();
 refreshAll();
 
 setTimeout(() => document.querySelector('.app')?.removeAttribute('data-boot'), 1500);
