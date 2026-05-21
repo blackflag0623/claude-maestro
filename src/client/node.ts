@@ -44,7 +44,10 @@ export class TerminalNode {
     this.el.className = 'node-host';
 
     this.term = new Terminal({
-      cursorBlink: true,
+      cursorBlink: false,
+      cursorInactiveStyle: 'none',
+      cursorStyle: 'bar',
+      cursorWidth: 0,
       fontFamily: '"JetBrains Mono", Consolas, "Cascadia Mono", Menlo, monospace',
       fontSize: 13,
       lineHeight: 1.2,
@@ -53,8 +56,8 @@ export class TerminalNode {
       theme: {
         background: '#0a0a0a',
         foreground: '#e8e8e3',
-        cursor: '#c6ff3d',
-        cursorAccent: '#0a0a0a',
+        cursor: 'transparent',
+        cursorAccent: 'transparent',
         selectionBackground: '#c6ff3d44',
         black: '#0a0a0a',
         brightBlack: '#3a3a3a',
