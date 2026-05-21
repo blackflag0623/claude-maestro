@@ -559,7 +559,7 @@ button { font: inherit; color: inherit; }
 .node-host .xterm,
 .node-host .xterm-viewport,
 .node-host .xterm-screen { height: 100% !important; }
-.node-host .xterm-viewport { background: transparent !important; overflow-y: scroll !important; }
+.node-host .xterm-viewport { background: transparent !important; }
 /* Claude CLI draws its prompt cursor as a reverse-video block (`\x1b[7m `).
    xterm renders that as a span carrying both bg-257 and fg-257 (the inverted
    foreground). Recolor it to our brand acid-lime so the cursor matches the
