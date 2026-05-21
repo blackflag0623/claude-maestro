@@ -14,6 +14,10 @@ export interface NodeEvents {
   activity?: (a: SessionActivity) => void;
 }
 
+const TERM_BG = '#0a0a0a';
+const TERM_FG = '#e8e8e3';
+const TERM_LIME = '#c6ff3d';
+
 /**
  * One Node = one xterm Terminal bound to one server-owned session by id.
  * The Terminal stays mounted (in a host element) for the node's lifetime so
@@ -54,16 +58,16 @@ export class TerminalNode {
       letterSpacing: 0,
       allowProposedApi: true,
       theme: {
-        background: '#0a0a0a',
-        foreground: '#e8e8e3',
-        cursor: '#0a0a0a',
-        cursorAccent: '#0a0a0a',
-        selectionBackground: '#c6ff3d44',
-        black: '#0a0a0a',
+        background: TERM_BG,
+        foreground: TERM_FG,
+        cursor: TERM_BG,
+        cursorAccent: TERM_BG,
+        selectionBackground: TERM_LIME + '44',
+        black: TERM_BG,
         brightBlack: '#3a3a3a',
         red: '#ff5c57',
         brightRed: '#ff6b66',
-        green: '#c6ff3d',
+        green: TERM_LIME,
         brightGreen: '#d4ff66',
         yellow: '#f3f99d',
         brightYellow: '#f8faa8',
@@ -73,7 +77,7 @@ export class TerminalNode {
         brightMagenta: '#ff7fcf',
         cyan: '#9aedfe',
         brightCyan: '#b4f1ff',
-        white: '#e8e8e3',
+        white: TERM_FG,
         brightWhite: '#ffffff',
       },
     });
