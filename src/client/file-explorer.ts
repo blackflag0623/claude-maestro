@@ -8,7 +8,7 @@ const HTML_ESCAPES: Record<string, string> = {
   '"': '&quot;',
   "'": '&#39;',
 };
-function escapeHtml(s: string): string {
+function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]!);
 }
 
@@ -30,11 +30,17 @@ function fmtSize(n?: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function $(el: HTMLElement, sel: string): HTMLElement {
+  return el.querySelector(sel) as HTMLElement;
+}
+
 export class FileExplorer {
   readonly el: HTMLDivElement;
   private currentPath = '';
   private cwdLabel = '';
   private viewerOpen = false;
+  private destroyed = false;
+  private pending: AbortController | null = null;
 
   constructor(
     private readonly api: MaestroApi,
@@ -58,8 +64,8 @@ export class FileExplorer {
       </div>
     `;
 
-    this.el.querySelector('[data-role="refresh"]')!.addEventListener('click', () => this.refresh());
-    this.el.querySelector('[data-role="vclose"]')!.addEventListener('click', () => this.closeViewer());
+    $(this.el, '[data-role="refresh"]').addEventListener('click', () => this.refresh());
+    $(this.el, '[data-role="vclose"]').addEventListener('click', () => this.closeViewer());
 
     void this.navigate('');
   }
@@ -69,15 +75,21 @@ export class FileExplorer {
   }
 
   private async navigate(rel: string) {
-    const $list = this.el.querySelector('[data-role="list"]') as HTMLElement;
+    if (this.destroyed) return;
+    this.pending?.abort();
+    const ac = (this.pending = new AbortController());
+
+    const $list = $(this.el, '[data-role="list"]');
     $list.innerHTML = `<div class="fx__msg">loading…</div>`;
     let res;
     try {
       res = await this.api.fsList(this.sessionId, rel);
     } catch (err) {
-      $list.innerHTML = `<div class="fx__msg fx__msg--err">${escapeHtml((err as Error).message)}</div>`;
+      if (ac.signal.aborted) return;
+      $list.innerHTML = `<div class="fx__msg fx__msg--err">${esc((err as Error).message)}</div>`;
       return;
     }
+    if (ac.signal.aborted) return;
     this.currentPath = res.path;
     this.cwdLabel = res.cwd;
     this.renderCrumbs();
@@ -85,16 +97,16 @@ export class FileExplorer {
   }
 
   private renderCrumbs() {
-    const $c = this.el.querySelector('[data-role="crumbs"]') as HTMLElement;
+    const $c = $(this.el, '[data-role="crumbs"]');
     const parts = this.currentPath ? this.currentPath.split(/[\\/]+/).filter(Boolean) : [];
     const segs: string[] = [
-      `<button class="fx__crumb" data-rel="" title="${escapeHtml(this.cwdLabel)}">root</button>`,
+      `<button class="fx__crumb" data-rel="" title="${esc(this.cwdLabel)}">root</button>`,
     ];
     let acc = '';
     for (const p of parts) {
       acc = acc ? acc + '/' + p : p;
       segs.push(`<span class="fx__crumb-sep">/</span>`);
-      segs.push(`<button class="fx__crumb" data-rel="${escapeHtml(acc)}">${escapeHtml(p)}</button>`);
+      segs.push(`<button class="fx__crumb" data-rel="${esc(acc)}">${esc(p)}</button>`);
     }
     $c.innerHTML = segs.join('');
     for (const btn of $c.querySelectorAll<HTMLButtonElement>('button.fx__crumb')) {
@@ -103,7 +115,7 @@ export class FileExplorer {
   }
 
   private renderList(entries: FsListEntry[]) {
-    const $list = this.el.querySelector('[data-role="list"]') as HTMLElement;
+    const $list = $(this.el, '[data-role="list"]');
     const rows: string[] = [];
     if (this.currentPath) {
       rows.push(
@@ -117,10 +129,10 @@ export class FileExplorer {
       const icon = e.kind === 'dir' ? '▸' : e.kind === 'file' ? '·' : '?';
       const meta = e.kind === 'file' ? fmtSize(e.size) : '';
       rows.push(
-        `<button class="fx__row" data-kind="${e.kind}" data-name="${escapeHtml(e.name)}">
+        `<button class="fx__row" data-kind="${e.kind}" data-name="${esc(e.name)}">
           <span class="fx__icon">${icon}</span>
-          <span class="fx__name">${escapeHtml(e.name)}</span>
-          <span class="fx__meta">${escapeHtml(meta)}</span>
+          <span class="fx__name">${esc(e.name)}</span>
+          <span class="fx__meta">${esc(meta)}</span>
         </button>`,
       );
     }
@@ -128,27 +140,25 @@ export class FileExplorer {
       rows.push(`<div class="fx__msg">empty directory</div>`);
     }
     $list.innerHTML = rows.join('');
-    for (const btn of $list.querySelectorAll<HTMLButtonElement>('button.fx__row')) {
+
+    // Single delegated listener instead of per-row listeners
+    $list.addEventListener('click', (ev) => {
+      const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('button.fx__row');
+      if (!btn) return;
       const kind = btn.dataset.kind;
-      if (kind === 'up') {
-        btn.addEventListener('click', () => this.navigate(parentRel(this.currentPath)));
-      } else if (kind === 'dir') {
-        btn.addEventListener('click', () =>
-          this.navigate(joinRel(this.currentPath, btn.dataset.name ?? '')),
-        );
-      } else if (kind === 'file') {
-        btn.addEventListener('click', () =>
-          this.openFile(joinRel(this.currentPath, btn.dataset.name ?? ''), btn.dataset.name ?? ''),
-        );
-      }
-    }
+      const name = btn.dataset.name ?? '';
+      if (kind === 'up') this.navigate(parentRel(this.currentPath));
+      else if (kind === 'dir') this.navigate(joinRel(this.currentPath, name));
+      else if (kind === 'file') this.openFile(joinRel(this.currentPath, name), name);
+    });
   }
 
   private async openFile(rel: string, name: string) {
-    const $viewer = this.el.querySelector('[data-role="viewer"]') as HTMLElement;
-    const $vname = this.el.querySelector('[data-role="vname"]') as HTMLElement;
-    const $vmeta = this.el.querySelector('[data-role="vmeta"]') as HTMLElement;
-    const $vbody = this.el.querySelector('[data-role="vbody"]') as HTMLElement;
+    if (this.destroyed) return;
+    const $viewer = $(this.el, '[data-role="viewer"]');
+    const $vname = $(this.el, '[data-role="vname"]');
+    const $vmeta = $(this.el, '[data-role="vmeta"]');
+    const $vbody = $(this.el, '[data-role="vbody"]');
     $viewer.classList.remove('is-hidden');
     this.viewerOpen = true;
     $vname.textContent = name;
@@ -174,10 +184,12 @@ export class FileExplorer {
   private closeViewer() {
     if (!this.viewerOpen) return;
     this.viewerOpen = false;
-    (this.el.querySelector('[data-role="viewer"]') as HTMLElement).classList.add('is-hidden');
+    $(this.el, '[data-role="viewer"]').classList.add('is-hidden');
   }
 
   destroy() {
-    if (this.el.parentElement) this.el.parentElement.removeChild(this.el);
+    this.destroyed = true;
+    this.pending?.abort();
+    this.el.remove();
   }
 }

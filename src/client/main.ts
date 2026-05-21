@@ -506,30 +506,15 @@ function toggleExplorer(ref: NodeRef) {
   scheduleRender();
 }
 
-function disposeExplorer(ref: NodeRef) {
-  const key = nodeKey(ref.serverId, ref.sessionId);
-  explorerOpen.delete(key);
-  const exp = explorers.get(key);
-  if (exp) {
-    exp.destroy();
-    explorers.delete(key);
-  }
-}
-void disposeExplorer;
-
 /** Returns the element that hosts the xterm for the given slot, or null. */
-function paneBody(slot: number): HTMLElement | null {
+function paneTermHost(slot: number): HTMLElement | null {
   const pane = $panes.children[slot] as HTMLElement | undefined;
-  if (!pane) return null;
-  return (
-    (pane.querySelector('.pane__term') as HTMLElement | null) ??
-    (pane.querySelector('.pane__body') as HTMLElement | null)
-  );
+  return (pane?.querySelector('[data-role="term"]') as HTMLElement | null) ?? null;
 }
 
 function paneExplorerHost(slot: number): HTMLElement | null {
   const pane = $panes.children[slot] as HTMLElement | undefined;
-  return (pane?.querySelector('.pane__explorer') as HTMLElement | null) ?? null;
+  return (pane?.querySelector('[data-role="explorer"]') as HTMLElement | null) ?? null;
 }
 
 /** Build all panes for the current layout from scratch. Idempotent w.r.t.
@@ -554,7 +539,7 @@ function renderPanes() {
   for (let i = 0; i < count; i++) {
     const ref = state.activeNodes[i];
     if (!ref) continue;
-    const body = paneBody(i);
+    const body = paneTermHost(i);
     if (!body) continue;
     body.classList.remove('is-empty');
     body.innerHTML = '';

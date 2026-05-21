@@ -158,82 +158,58 @@ function resizeSession(s: Session, cols: number, rows: number) {
   } catch {}
 }
 
-// Writes >1KB (typically paste events) are split into chunks and dispatched
-// across libuv ticks. ConPTY on Windows has a small kernel pipe buffer; one
-// large write can outrun the TUI's reader and drop bytes in the middle. The
-// chunk size is small enough to fit comfortably in any PTY buffer, and
-// setImmediate between chunks lets node-pty drain before the next write.
-// Keystroke-sized inputs (the common case) take the synchronous fast path.
-//
-// Bracketed-paste spans (\e[200~ ... \e[201~) are kept intact when they fit
-// in PTY_BRACKETED_MAX so the TUI sees the whole span in one read. Splitting
-// inside a span is technically safe (the TUI buffers until \e[201~), but a
-// single write avoids a class of corner-case races where intermediate output
-// from the TUI interleaves with our paste chunks.
+// Writes >1KB are split into chunks dispatched across libuv ticks so
+// node-pty drains between writes (ConPTY's pipe buffer is small).
+// Bracketed-paste spans are kept atomic (up to 64 KB) so the TUI sees
+// the whole span in one read.
 const PTY_WRITE_CHUNK = 1024;
 const PTY_BRACKETED_MAX = 64 * 1024;
 const PASTE_START = '\x1b[200~';
 const PASTE_END = '\x1b[201~';
 
+function splitPasteSpans(data: string): string[] {
+  const parts: string[] = [];
+  let i = 0;
+  while (i < data.length) {
+    const start = data.indexOf(PASTE_START, i);
+    if (start < 0) { parts.push(data.slice(i)); break; }
+    if (start > i) parts.push(data.slice(i, start));
+    const end = data.indexOf(PASTE_END, start + PASTE_START.length);
+    if (end < 0) { parts.push(data.slice(start)); break; }
+    const spanEnd = end + PASTE_END.length;
+    parts.push(data.slice(start, spanEnd));
+    i = spanEnd;
+  }
+  return parts;
+}
+
 function writeToPty(s: Session, data: string) {
   if (!s.term || data.length === 0) return;
 
-  // Fast path: short input, no paste markers — write synchronously.
   if (data.length <= PTY_WRITE_CHUNK && !data.includes(PASTE_START)) {
     s.term.write(data);
     return;
   }
 
-  // Walk the buffer, peeling off either a bracketed-paste span (atomic when
-  // small enough) or a plain region (chunked across ticks).
-  const writes: string[] = [];
-  let i = 0;
-  while (i < data.length) {
-    const start = data.indexOf(PASTE_START, i);
-    if (start < 0) {
-      writes.push(data.slice(i));
-      break;
-    }
-    if (start > i) writes.push(data.slice(i, start));
-    const end = data.indexOf(PASTE_END, start + PASTE_START.length);
-    if (end < 0) {
-      // Unterminated span — just send the rest as one piece.
-      writes.push(data.slice(start));
-      break;
-    }
-    const spanEnd = end + PASTE_END.length;
-    writes.push(data.slice(start, spanEnd));
-    i = spanEnd;
-  }
+  const parts = splitPasteSpans(data);
+  let pi = 0;
+  let off = 0;
 
-  // Dispatch: each entry is either a bracketed-paste span (write whole if
-  // it fits) or plain data (chunked). All hops are sequenced via setImmediate
-  // so node-pty drains between writes.
-  let idx = 0;
-  let offset = 0;
   const pump = () => {
-    if (!s.term) return;
-    while (idx < writes.length) {
-      const piece = writes[idx]!;
-      const isPaste = piece.startsWith(PASTE_START);
-      if (isPaste && piece.length <= PTY_BRACKETED_MAX) {
-        s.term.write(piece);
-        idx++;
-        offset = 0;
-        setImmediate(pump);
-        return;
-      }
-      // Chunked write (plain region, or oversized paste span).
-      const slice = piece.slice(offset, offset + PTY_WRITE_CHUNK);
-      s.term.write(slice);
-      offset += slice.length;
-      if (offset >= piece.length) {
-        idx++;
-        offset = 0;
-      }
-      setImmediate(pump);
-      return;
+    if (!s.term || pi >= parts.length) return;
+    const piece = parts[pi]!;
+
+    if (piece.startsWith(PASTE_START) && piece.length <= PTY_BRACKETED_MAX) {
+      s.term.write(piece);
+      pi++;
+      off = 0;
+    } else {
+      s.term.write(piece.slice(off, off + PTY_WRITE_CHUNK));
+      off += PTY_WRITE_CHUNK;
+      if (off >= piece.length) { pi++; off = 0; }
     }
+
+    if (pi < parts.length) setImmediate(pump);
   };
   pump();
 }

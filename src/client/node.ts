@@ -83,9 +83,7 @@ export class TerminalNode {
     });
     this.term.loadAddon(this.fit);
     this.term.open(this.el);
-    // WebGL renderer: faster + correct for fast-output / wide-char edge cases
-    // that the DOM renderer botches (half-line wraps, missing glyphs). On
-    // context loss (GPU sleep, tab restore) we dispose and fall back to DOM.
+    // WebGL renderer — falls back to DOM on context loss.
     try {
       const webgl = new WebglAddon();
       webgl.onContextLoss(() => {
@@ -100,20 +98,13 @@ export class TerminalNode {
     this.indicator = buildCursorIndicator();
     this.el.appendChild(this.indicator.el);
 
-    // Paste path — single funnel. Both Ctrl/Cmd+V (keyboard) and the DOM
-    // `paste` event (right-click, middle-click on Linux, IME paste) call
-    // `pasteText`, which wraps the content in bracketed-paste markers so
-    // Claude's TUI treats it as one atomic input. Without the markers, every
-    // embedded \n is read as Enter and the prompt submits partway. The two
-    // entry points coordinate via `lastPasteAt` to avoid double-firing when
-    // the browser delivers a `paste` event in response to Ctrl+V.
+    // All paste paths funnel through pasteText() which wraps content in
+    // bracketed-paste markers. Keyboard and DOM entry points coordinate
+    // via lastPasteAt to avoid double-firing.
     this.term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true;
       const ctrl = e.ctrlKey || e.metaKey;
       if (ctrl && e.key.toLowerCase() === 'v') {
-        // Read explicitly — relying on the synthesized `paste` event alone is
-        // unreliable across browsers/focus states. The DOM paste listener
-        // below will see this timestamp and skip its own read.
         this.lastPasteAt = Date.now();
         navigator.clipboard
           .readText()
@@ -128,19 +119,15 @@ export class TerminalNode {
       return true;
     });
 
-    // Catch right-click paste / middle-click paste / IME paste. xterm's
-    // built-in paste handler is bypassed entirely so there's exactly one
-    // bracketed-paste wrapper in the system.
+    // Catch right-click / middle-click / IME paste. Capture phase blocks
+    // xterm's built-in handler.
     this.el.addEventListener(
       'paste',
       (e) => {
         e.preventDefault();
         e.stopPropagation();
-        // If Ctrl+V fired within the last 250 ms, the keyboard path is
-        // already handling this paste — don't double-send.
         if (Date.now() - this.lastPasteAt < 250) return;
-        const text = e.clipboardData?.getData('text') ?? '';
-        this.pasteText(text);
+        this.pasteText(e.clipboardData?.getData('text') ?? '');
       },
       true,
     );
@@ -178,9 +165,6 @@ export class TerminalNode {
 
   private pasteText(text: string) {
     if (!text) return;
-    // Normalize \r\n and bare \r to \n so the TUI sees consistent newlines
-    // inside the bracketed-paste span. The TUI will turn the markers back
-    // into a single multi-line input.
     const normalized = text.replace(/\r\n?/g, '\n');
     this.send({ type: 'input', data: `\x1b[200~${normalized}\x1b[201~` });
   }
