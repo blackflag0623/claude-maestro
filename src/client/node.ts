@@ -1,5 +1,6 @@
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import type { ClientMessage, ServerMessage, SessionInfo, SessionActivity } from '../shared/protocol';
 import type { MaestroApi } from './api';
@@ -22,6 +23,7 @@ export class TerminalNode {
   readonly el: HTMLDivElement;
   readonly term: Terminal;
   private readonly fit = new FitAddon();
+  private webgl: WebglAddon | null = null;
   private ws: WebSocket | null = null;
   private reconnectDelay = 500;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -29,6 +31,7 @@ export class TerminalNode {
   private resizeObserver: ResizeObserver | null = null;
   private _status: NodeStatus = 'connecting';
   private _activity: SessionActivity = 'unknown';
+  private lastPasteAt = 0;
   private readonly indicator: CursorIndicator;
   session: SessionInfo | null = null;
 
@@ -73,33 +76,41 @@ export class TerminalNode {
     });
     this.term.loadAddon(this.fit);
     this.term.open(this.el);
+    // WebGL renderer: faster + correct for fast-output / wide-char edge cases
+    // that the DOM renderer botches (half-line wraps, missing glyphs). On
+    // context loss (GPU sleep, tab restore) we dispose and fall back to DOM.
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => {
+        try { webgl.dispose(); } catch {}
+        this.webgl = null;
+      });
+      this.term.loadAddon(webgl);
+      this.webgl = webgl;
+    } catch (err) {
+      console.warn('[maestro] WebGL renderer unavailable, falling back to DOM:', err);
+    }
     this.indicator = buildCursorIndicator();
     this.el.appendChild(this.indicator.el);
 
-    // Ctrl/Cmd+V → fetch from clipboard and paste via xterm. Going through
-    // term.paste(): (a) normalizes \r\n → \r so newlines arrive as Enter keys,
-    // (b) wraps text in bracketed-paste escapes (\e[200~…\e[201~) when the
-    // TUI enabled them — without this, Claude's TUI sees the first \n as
-    // Enter and submits the prompt, truncating the remainder. Pasted text
-    // exits via the standard onData listener below. (See KNOWN_ISSUES.md)
-    // Ctrl/Cmd+C with selection → copy.
+    // Paste path — single funnel. Both Ctrl/Cmd+V (keyboard) and the DOM
+    // `paste` event (right-click, middle-click on Linux, IME paste) call
+    // `pasteText`, which wraps the content in bracketed-paste markers so
+    // Claude's TUI treats it as one atomic input. Without the markers, every
+    // embedded \n is read as Enter and the prompt submits partway. The two
+    // entry points coordinate via `lastPasteAt` to avoid double-firing when
+    // the browser delivers a `paste` event in response to Ctrl+V.
     this.term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true;
       const ctrl = e.ctrlKey || e.metaKey;
       if (ctrl && e.key.toLowerCase() === 'v') {
+        // Read explicitly — relying on the synthesized `paste` event alone is
+        // unreliable across browsers/focus states. The DOM paste listener
+        // below will see this timestamp and skip its own read.
+        this.lastPasteAt = Date.now();
         navigator.clipboard
           .readText()
-          .then((text) => {
-            if (!text) return;
-            // Wrap clipboard content as a bracketed paste so Claude's TUI
-            // treats it as one atomic input. Without the markers, every
-            // embedded \n is read as Enter and the prompt submits partway,
-            // discarding the remainder. xterm's term.paste() won't add the
-            // markers unless it observed \e[?2004h on the wire, so wrap
-            // manually. Normalize \r\n → \n inside the span.
-            const normalized = text.replace(/\r\n?/g, '\n');
-            this.send({ type: 'input', data: `\x1b[200~${normalized}\x1b[201~` });
-          })
+          .then((text) => this.pasteText(text))
           .catch(() => {});
         return false;
       }
@@ -109,6 +120,23 @@ export class TerminalNode {
       }
       return true;
     });
+
+    // Catch right-click paste / middle-click paste / IME paste. xterm's
+    // built-in paste handler is bypassed entirely so there's exactly one
+    // bracketed-paste wrapper in the system.
+    this.el.addEventListener(
+      'paste',
+      (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        // If Ctrl+V fired within the last 250 ms, the keyboard path is
+        // already handling this paste — don't double-send.
+        if (Date.now() - this.lastPasteAt < 250) return;
+        const text = e.clipboardData?.getData('text') ?? '';
+        this.pasteText(text);
+      },
+      true,
+    );
 
     this.term.onData((data) => this.send({ type: 'input', data }));
     this.term.onResize(({ cols, rows }) => this.send({ type: 'resize', cols, rows }));
@@ -139,6 +167,15 @@ export class TerminalNode {
     if (this.ws && this.ws.readyState === this.ws.OPEN) {
       this.ws.send(JSON.stringify(msg));
     }
+  }
+
+  private pasteText(text: string) {
+    if (!text) return;
+    // Normalize \r\n and bare \r to \n so the TUI sees consistent newlines
+    // inside the bracketed-paste span. The TUI will turn the markers back
+    // into a single multi-line input.
+    const normalized = text.replace(/\r\n?/g, '\n');
+    this.send({ type: 'input', data: `\x1b[200~${normalized}\x1b[201~` });
   }
 
   /** Mount into a host container (called when this node becomes active). */
@@ -175,6 +212,9 @@ export class TerminalNode {
     }
     this.resizeObserver?.disconnect();
     this.indicator.stop();
+    try {
+      this.webgl?.dispose();
+    } catch {}
     try {
       this.ws?.close();
     } catch {}

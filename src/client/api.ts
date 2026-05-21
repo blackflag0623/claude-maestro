@@ -1,4 +1,9 @@
-import type { CreateSessionBody, SessionInfo } from '../shared/protocol';
+import type {
+  CreateSessionBody,
+  FsListResponse,
+  FsReadResponse,
+  SessionInfo,
+} from '../shared/protocol';
 
 async function failure(r: Response, fallback: string): Promise<never> {
   let detail = `${fallback} ${r.status}`;
@@ -63,6 +68,26 @@ export class MaestroApi {
   ): Promise<{ base: string; entries: string[] }> {
     const r = await fetch(this.url(`/api/fs/complete?prefix=${encodeURIComponent(prefix)}`), init);
     if (!r.ok) await failure(r, 'complete');
+    return r.json();
+  }
+
+  async fsList(sessionId: string, path = ''): Promise<FsListResponse> {
+    const r = await fetch(
+      this.url(
+        `/api/fs/list?sessionId=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}`,
+      ),
+    );
+    if (!r.ok) await failure(r, 'fs list');
+    return r.json();
+  }
+
+  async fsRead(sessionId: string, path: string): Promise<FsReadResponse> {
+    const r = await fetch(
+      this.url(
+        `/api/fs/read?sessionId=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}`,
+      ),
+    );
+    if (!r.ok) await failure(r, 'fs read');
     return r.json();
   }
 }

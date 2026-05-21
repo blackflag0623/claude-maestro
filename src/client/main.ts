@@ -1,6 +1,7 @@
 import { MaestroApi } from './api';
 import { TerminalNode, type NodeStatus } from './node';
 import { attachPathPicker } from './path-picker';
+import { FileExplorer } from './file-explorer';
 import {
   exportBundle,
   importBundle,
@@ -29,6 +30,8 @@ interface ServerRuntime {
 let state: PersistedState = loadState();
 const servers = new Map<string, ServerRuntime>();
 const nodes = new Map<string, TerminalNode>(); // key from `nodeKey`
+const explorers = new Map<string, FileExplorer>(); // key from `nodeKey`
+const explorerOpen = new Set<string>(); // nodeKey set: explorer currently open
 
 const nodeKey = (serverId: string, sessionId: string) => `${serverId}::${sessionId}`;
 
@@ -387,6 +390,9 @@ function removeServer(serverId: string) {
     if (key.startsWith(`${serverId}::`)) {
       n.destroy();
       nodes.delete(key);
+      explorers.get(key)?.destroy();
+      explorers.delete(key);
+      explorerOpen.delete(key);
     }
   }
   state.servers = state.servers.filter((s) => s.id !== serverId);
@@ -436,6 +442,9 @@ async function killNode(serverId: string, sessionId: string) {
   const key = nodeKey(serverId, sessionId);
   nodes.get(key)?.destroy();
   nodes.delete(key);
+  explorers.get(key)?.destroy();
+  explorers.delete(key);
+  explorerOpen.delete(key);
   state.knownNodes[serverId] = (state.knownNodes[serverId] ?? []).filter(
     (n) => n.sessionId !== sessionId,
   );
@@ -477,10 +486,50 @@ function getOrCreateNode(ref: NodeRef): TerminalNode {
   return node;
 }
 
-/** Returns the .pane__body element for the given slot index, or null. */
+function getOrCreateExplorer(ref: NodeRef): FileExplorer {
+  const key = nodeKey(ref.serverId, ref.sessionId);
+  let exp = explorers.get(key);
+  if (exp) return exp;
+  exp = new FileExplorer(runtimeFor(ref.serverId).api, ref.sessionId);
+  explorers.set(key, exp);
+  return exp;
+}
+
+function toggleExplorer(ref: NodeRef) {
+  const key = nodeKey(ref.serverId, ref.sessionId);
+  if (explorerOpen.has(key)) {
+    explorerOpen.delete(key);
+  } else {
+    explorerOpen.add(key);
+  }
+  renderPanes();
+  scheduleRender();
+}
+
+function disposeExplorer(ref: NodeRef) {
+  const key = nodeKey(ref.serverId, ref.sessionId);
+  explorerOpen.delete(key);
+  const exp = explorers.get(key);
+  if (exp) {
+    exp.destroy();
+    explorers.delete(key);
+  }
+}
+void disposeExplorer;
+
+/** Returns the element that hosts the xterm for the given slot, or null. */
 function paneBody(slot: number): HTMLElement | null {
   const pane = $panes.children[slot] as HTMLElement | undefined;
-  return (pane?.querySelector('.pane__body') as HTMLElement | null) ?? null;
+  if (!pane) return null;
+  return (
+    (pane.querySelector('.pane__term') as HTMLElement | null) ??
+    (pane.querySelector('.pane__body') as HTMLElement | null)
+  );
+}
+
+function paneExplorerHost(slot: number): HTMLElement | null {
+  const pane = $panes.children[slot] as HTMLElement | undefined;
+  return (pane?.querySelector('.pane__explorer') as HTMLElement | null) ?? null;
 }
 
 /** Build all panes for the current layout from scratch. Idempotent w.r.t.
@@ -511,6 +560,16 @@ function renderPanes() {
     body.innerHTML = '';
     const node = getOrCreateNode(ref);
     node.mount(body);
+    // If the explorer is open for this node, mount it too.
+    const key = nodeKey(ref.serverId, ref.sessionId);
+    if (explorerOpen.has(key)) {
+      const host = paneExplorerHost(i);
+      if (host) {
+        const exp = getOrCreateExplorer(ref);
+        host.innerHTML = '';
+        host.appendChild(exp.el);
+      }
+    }
   }
 
   refreshFocusedPaneFocus();
@@ -529,27 +588,37 @@ function buildPane(slot: number): HTMLElement {
   pane.dataset.activity = node?.activity ?? 'unknown';
 
   const title = ref ? ref.title : 'empty slot';
+  const openExp = ref ? explorerOpen.has(nodeKey(ref.serverId, ref.sessionId)) : false;
   pane.innerHTML = `
     <header class="pane__head">
       <span class="pane__bar"></span>
       <span class="pane__slot-num">${slot + 1}</span>
       <span class="pane__label">${escapeHtml(title)}</span>
       <span class="pane__activity"></span>
+      ${ref ? `<button class="pane__files" type="button" title="toggle file explorer" aria-label="files"${openExp ? ' aria-pressed="true"' : ''}>files</button>` : ''}
       ${ref ? `<button class="pane__close" type="button" title="detach (keeps session alive)" aria-label="detach">\u00d7</button>` : ''}
     </header>
-    <div class="pane__body${ref ? '' : ' is-empty'}">${
-      ref ? '' : '<span class="pane__hint">empty — pick a node from the sidebar, or drop one here</span>'
+    <div class="pane__body${ref ? '' : ' is-empty'}${openExp ? ' is-split' : ''}">${
+      ref
+        ? '<div class="pane__term" data-role="term"></div>' +
+          (openExp ? '<div class="pane__explorer" data-role="explorer"></div>' : '')
+        : '<span class="pane__hint">empty — pick a node from the sidebar, or drop one here</span>'
     }</div>
   `;
 
   pane.addEventListener('mousedown', (e) => {
     if ((e.target as HTMLElement).closest('.pane__close')) return;
+    if ((e.target as HTMLElement).closest('.pane__files')) return;
     if (slot !== state.focusedPane) focusPane(slot);
   });
   if (ref) {
     pane.querySelector('.pane__close')!.addEventListener('click', (e) => {
       e.stopPropagation();
       detachSlot(slot);
+    });
+    pane.querySelector('.pane__files')!.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleExplorer(ref);
     });
   }
 

@@ -40,6 +40,24 @@ export type ClientMessage =
   | { type: 'input'; data: string }
   | { type: 'resize'; cols: number; rows: number };
 
+export interface FsListEntry {
+  name: string;
+  kind: 'dir' | 'file' | 'other';
+  size?: number;
+  mtime?: number;
+}
+
+export interface FsListResponse {
+  cwd: string;
+  path: string; // relative to cwd; '' = root
+  abs: string;
+  entries: FsListEntry[];
+}
+
+export type FsReadResponse =
+  | { binary: false; size: number; mtime: number; content: string; abs: string }
+  | { binary: true; size: number; abs: string };
+
 export type ServerMessage =
   | { type: 'attached'; session: SessionInfo; scrollback: string }
   | { type: 'output'; data: string }

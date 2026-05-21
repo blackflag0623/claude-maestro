@@ -164,22 +164,78 @@ function resizeSession(s: Session, cols: number, rows: number) {
 // chunk size is small enough to fit comfortably in any PTY buffer, and
 // setImmediate between chunks lets node-pty drain before the next write.
 // Keystroke-sized inputs (the common case) take the synchronous fast path.
+//
+// Bracketed-paste spans (\e[200~ ... \e[201~) are kept intact when they fit
+// in PTY_BRACKETED_MAX so the TUI sees the whole span in one read. Splitting
+// inside a span is technically safe (the TUI buffers until \e[201~), but a
+// single write avoids a class of corner-case races where intermediate output
+// from the TUI interleaves with our paste chunks.
 const PTY_WRITE_CHUNK = 1024;
+const PTY_BRACKETED_MAX = 64 * 1024;
+const PASTE_START = '\x1b[200~';
+const PASTE_END = '\x1b[201~';
 
 function writeToPty(s: Session, data: string) {
   if (!s.term || data.length === 0) return;
-  if (data.length <= PTY_WRITE_CHUNK) {
+
+  // Fast path: short input, no paste markers — write synchronously.
+  if (data.length <= PTY_WRITE_CHUNK && !data.includes(PASTE_START)) {
     s.term.write(data);
     return;
   }
+
+  // Walk the buffer, peeling off either a bracketed-paste span (atomic when
+  // small enough) or a plain region (chunked across ticks).
+  const writes: string[] = [];
   let i = 0;
-  const writeNext = () => {
-    if (!s.term || i >= data.length) return;
-    s.term.write(data.slice(i, i + PTY_WRITE_CHUNK));
-    i += PTY_WRITE_CHUNK;
-    if (i < data.length) setImmediate(writeNext);
+  while (i < data.length) {
+    const start = data.indexOf(PASTE_START, i);
+    if (start < 0) {
+      writes.push(data.slice(i));
+      break;
+    }
+    if (start > i) writes.push(data.slice(i, start));
+    const end = data.indexOf(PASTE_END, start + PASTE_START.length);
+    if (end < 0) {
+      // Unterminated span — just send the rest as one piece.
+      writes.push(data.slice(start));
+      break;
+    }
+    const spanEnd = end + PASTE_END.length;
+    writes.push(data.slice(start, spanEnd));
+    i = spanEnd;
+  }
+
+  // Dispatch: each entry is either a bracketed-paste span (write whole if
+  // it fits) or plain data (chunked). All hops are sequenced via setImmediate
+  // so node-pty drains between writes.
+  let idx = 0;
+  let offset = 0;
+  const pump = () => {
+    if (!s.term) return;
+    while (idx < writes.length) {
+      const piece = writes[idx]!;
+      const isPaste = piece.startsWith(PASTE_START);
+      if (isPaste && piece.length <= PTY_BRACKETED_MAX) {
+        s.term.write(piece);
+        idx++;
+        offset = 0;
+        setImmediate(pump);
+        return;
+      }
+      // Chunked write (plain region, or oversized paste span).
+      const slice = piece.slice(offset, offset + PTY_WRITE_CHUNK);
+      s.term.write(slice);
+      offset += slice.length;
+      if (offset >= piece.length) {
+        idx++;
+        offset = 0;
+      }
+      setImmediate(pump);
+      return;
+    }
   };
-  writeNext();
+  pump();
 }
 
 function expandHome(p: string): string {
@@ -468,6 +524,123 @@ app.get('/api/fs/complete', (req, res) => {
   }
   out.sort((a, b) => a.localeCompare(b));
   res.json({ base: dir, entries: out });
+});
+
+// ───────── filesystem browse + read (per-session, clamped to cwd) ─────────
+
+const FS_READ_MAX_BYTES = 2 * 1024 * 1024;
+
+function resolveInsideCwd(cwd: string, rel: string): { abs: string; rel: string } {
+  const abs = path.resolve(cwd, rel || '.');
+  const r = path.relative(cwd, abs);
+  const outside = r.startsWith('..') || path.isAbsolute(r);
+  if (outside) {
+    const e = new Error('path is outside session cwd') as Error & { code?: string };
+    e.code = 'OUTSIDE_CWD';
+    throw e;
+  }
+  return { abs, rel: r };
+}
+
+app.get('/api/fs/list', (req, res) => {
+  const sid = String(req.query.sessionId ?? '');
+  const s = sessions.get(sid);
+  if (!s) {
+    res.status(404).json({ error: 'session not found' });
+    return;
+  }
+  const rel = String(req.query.path ?? '');
+  let resolved;
+  try {
+    resolved = resolveInsideCwd(s.cwd, rel);
+  } catch (err) {
+    const e = err as Error & { code?: string };
+    res.status(e.code === 'OUTSIDE_CWD' ? 403 : 400).json({ error: e.message });
+    return;
+  }
+  let dirents: fs.Dirent[];
+  try {
+    dirents = fs.readdirSync(resolved.abs, { withFileTypes: true });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+    return;
+  }
+  const entries = dirents.map((d) => {
+    const kind: 'dir' | 'file' | 'other' = d.isDirectory() ? 'dir' : d.isFile() ? 'file' : 'other';
+    const entry: { name: string; kind: typeof kind; size?: number; mtime?: number } = {
+      name: d.name,
+      kind,
+    };
+    if (kind === 'file') {
+      try {
+        const st = fs.statSync(path.join(resolved.abs, d.name));
+        entry.size = st.size;
+        entry.mtime = st.mtimeMs;
+      } catch {}
+    }
+    return entry;
+  });
+  entries.sort((a, b) => {
+    if (a.kind !== b.kind) {
+      if (a.kind === 'dir') return -1;
+      if (b.kind === 'dir') return 1;
+    }
+    return a.name.localeCompare(b.name);
+  });
+  res.json({ cwd: s.cwd, path: resolved.rel, abs: resolved.abs, entries });
+});
+
+app.get('/api/fs/read', (req, res) => {
+  const sid = String(req.query.sessionId ?? '');
+  const s = sessions.get(sid);
+  if (!s) {
+    res.status(404).json({ error: 'session not found' });
+    return;
+  }
+  const rel = String(req.query.path ?? '');
+  let resolved;
+  try {
+    resolved = resolveInsideCwd(s.cwd, rel);
+  } catch (err) {
+    const e = err as Error & { code?: string };
+    res.status(e.code === 'OUTSIDE_CWD' ? 403 : 400).json({ error: e.message });
+    return;
+  }
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(resolved.abs);
+  } catch (err) {
+    res.status(404).json({ error: (err as Error).message });
+    return;
+  }
+  if (st.isDirectory()) {
+    res.status(400).json({ error: 'path is a directory' });
+    return;
+  }
+  if (st.size > FS_READ_MAX_BYTES) {
+    res.status(413).json({ error: `file too large (${st.size} bytes, max ${FS_READ_MAX_BYTES})` });
+    return;
+  }
+  let buf: Buffer;
+  try {
+    buf = fs.readFileSync(resolved.abs);
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+    return;
+  }
+  const sniff = buf.subarray(0, Math.min(buf.length, 8192));
+  const binary = sniff.includes(0);
+  if (binary) {
+    res.json({ binary: true, size: st.size, abs: resolved.abs });
+    return;
+  }
+  res.json({
+    binary: false,
+    size: st.size,
+    mtime: st.mtimeMs,
+    content: buf.toString('utf8'),
+    abs: resolved.abs,
+  });
 });
 
 const clientDist = path.resolve(__dirname, '../client');
