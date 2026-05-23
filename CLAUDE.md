@@ -54,6 +54,13 @@ Express + `ws` `WebSocketServer` (manual `noServer:true` upgrade, gated by `?ses
 - **Killing a node** (`DELETE /api/sessions/:id`) removes the session from the registry. The underlying Claude conversation file is left on disk for manual recovery via `claude --resume <uuid>` from a shell.
 - **Scrollback (terminal pixels) is lost on maestro restart.** The conversation (Claude's history of messages and tool calls) is not.
 
+## Working style
+
+- **Surface tradeoffs, don't pick silently.** If a request has multiple reasonable interpretations or a meaningfully simpler approach exists, name them in one or two sentences before implementing. State load-bearing assumptions explicitly.
+- **Ask vs. proceed.** Reversible local changes (edits, refactors inside the scope of the request, restartable dev server): just do them. Architectural choices, anything touching persistence format / WS protocol / external surfaces, or work where you'd have to guess at intent: ask first.
+- **Define what "done" looks like before you start non-trivial work.** This repo has no test/lint/typecheck scripts, so success usually means one of: `npm run build` passes, a concrete manual repro in the browser (state the steps), or a specific behavior observed in the PTY/WS traffic. "Make it work" is not a success criterion — name the check.
+- **Report failures as failures.** If a change is partial, a build breaks, or a manual check wasn't run, say so plainly. Don't paper over with a confident summary.
+
 ## Conventions
 
 - **Cross-platform is the default target.** macOS, Linux, and Windows must all work for every feature, new or evolving. No POSIX-only shell scripts (`#!/bin/sh`, `bash`, `curl`, `chmod`, `&` backgrounding); no Windows-only assumptions either. When a feature needs an out-of-process helper, write it as a Node script invoked via `process.execPath` so it runs anywhere claude-maestro itself runs. Quote paths with spaces. Use `path.join` / `path.sep`, never hardcoded `/`. If a platform genuinely cannot be supported, gate explicitly and document why — silent `if (platform === 'win32') return;` is a regression.
