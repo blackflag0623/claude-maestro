@@ -26,7 +26,12 @@ export class MaestroApi {
   }
 
   wsUrl(sessionId: string): string {
-    const u = new URL(this.baseUrl, location.href);
+    // Anchor against the page origin, not its pathname. The mobile client is
+    // served under /m/ — `new URL('', location.href)` would keep that prefix
+    // and produce /m/maestro-ws, which neither the Vite proxy nor the server
+    // upgrade gate accept. Absolute baseUrls (remote servers) still resolve
+    // correctly because they include their own scheme+host.
+    const u = new URL(this.baseUrl || '/', location.href);
     u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
     u.pathname = u.pathname.replace(/\/$/, '') + '/maestro-ws';
     u.search = `?sessionId=${encodeURIComponent(sessionId)}`;

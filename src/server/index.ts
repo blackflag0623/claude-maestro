@@ -7,7 +7,9 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import * as pty from '@lydell/node-pty';
+import { TranscriptReader } from './transcript-reader.js';
 import type {
+  ChatMessage,
   ClientMessage,
   ServerMessage,
   SessionInfo,
@@ -39,6 +41,14 @@ interface Session extends PersistedSession {
   exitCode: number | null;
   scrollback: string;
   subscribers: Set<WebSocket>;
+  /** Subset of `subscribers` that attached via `attachChat`. They receive
+   *  `chatMessage` frames (parsed from Claude's JSONL transcript) instead of
+   *  raw `output`. */
+  chatSubscribers: Set<WebSocket>;
+  /** Incremental reader of `~/.claude/projects/<slug>/<uuid>.jsonl`. Lazily
+   *  created on first chat attach; primed with whole file as history then
+   *  advanced on every Stop hook. */
+  transcriptReader: TranscriptReader | null;
   activity: SessionActivity;
 }
 
@@ -86,6 +96,8 @@ function loadPersisted() {
       exitCode: null,
       scrollback: '',
       subscribers: new Set(),
+      chatSubscribers: new Set(),
+      transcriptReader: null,
       activity: 'unknown',
     });
   }
@@ -145,6 +157,22 @@ function appendScrollback(s: Session, data: string) {
 function broadcast(s: Session, msg: ServerMessage) {
   const payload = JSON.stringify(msg);
   for (const ws of s.subscribers) {
+    if (ws.readyState === ws.OPEN) ws.send(payload);
+  }
+}
+
+/** Sends a frame to terminal subscribers (everyone in `subscribers` who is NOT a chat client). */
+function broadcastTerminal(s: Session, msg: ServerMessage) {
+  const payload = JSON.stringify(msg);
+  for (const ws of s.subscribers) {
+    if (s.chatSubscribers.has(ws)) continue;
+    if (ws.readyState === ws.OPEN) ws.send(payload);
+  }
+}
+
+function broadcastChat(s: Session, msg: ServerMessage) {
+  const payload = JSON.stringify(msg);
+  for (const ws of s.chatSubscribers) {
     if (ws.readyState === ws.OPEN) ws.send(payload);
   }
 }
@@ -322,7 +350,7 @@ function spawnClaude(s: Session, mode: 'new' | 'resume') {
 
   term.onData((data: string) => {
     appendScrollback(s, data);
-    broadcast(s, { type: 'output', data });
+    broadcastTerminal(s, { type: 'output', data });
     // Once we've seen *any* output, the conversation file exists on disk.
     if (!s.hasResumeData) {
       s.hasResumeData = true;
@@ -365,6 +393,8 @@ function createSession(body: CreateSessionBody): Session {
     exitCode: null,
     scrollback: '',
     subscribers: new Set(),
+    chatSubscribers: new Set(),
+    transcriptReader: null,
     activity: 'unknown',
   };
   sessions.set(id, s);
@@ -448,11 +478,48 @@ app.delete('/api/sessions/:id', (req, res) => {
 app.post('/api/hook', (req, res) => {
   const event = String(req.headers['x-maestro-event'] ?? '');
   const sid = (req.body?.session_id as string | undefined) ?? '';
+  console.log(`[hook] event=${event} session_id=${sid.slice(0, 8)}`);
   const next = (HOOK_ACTIVITY as Record<string, SessionActivity>)[event];
   const s = sid ? sessions.get(sid) : undefined;
+  if (!s && sid) {
+    console.log(`[hook] no session in map for ${sid.slice(0, 8)} — known: [${[...sessions.keys()].map((k) => k.slice(0, 8)).join(',')}]`);
+  }
   if (s && next) setActivity(s, next);
+  // Stop = end of one assistant turn. New transcript entries are now on disk;
+  // flush them to chat subscribers.
+  if (s && event === 'Stop') flushTranscript(s);
   res.status(204).end();
 });
+
+function flushTranscript(s: Session) {
+  console.log(`[flush] ${s.id.slice(0, 8)} chatSubscribers=${s.chatSubscribers.size}`);
+  if (s.chatSubscribers.size === 0) return;
+  if (!s.transcriptReader) s.transcriptReader = new TranscriptReader(s.id, s.cwd);
+
+  // Race: Claude's `Stop` hook fires before the assistant entries are fully
+  // appended to the JSONL file. Worse, one turn can write *multiple*
+  // assistant entries (tool-call followed by text reply, or split text).
+  // Strategy: poll across an exponential schedule and broadcast whatever
+  // appears each time. Offset tracking inside the reader prevents duplicate
+  // broadcasts. We never short-circuit on "saw assistant once" because a
+  // second entry can still be in flight.
+  const POLL_DELAYS_MS = [0, 120, 300, 600, 1200, 2400, 4000];
+  let attempt = 0;
+  const tick = () => {
+    const msgs = s.transcriptReader!.readIncremental();
+    if (msgs.length) {
+      console.log(`[flush] ${s.id.slice(0, 8)} attempt ${attempt} → ${msgs.length} msg(s): [${msgs.map((m) => m.type).join(',')}]`);
+    }
+    for (const m of msgs) {
+      broadcastChat(s, { type: 'chatMessage', message: m });
+    }
+    attempt++;
+    if (attempt < POLL_DELAYS_MS.length) {
+      setTimeout(tick, POLL_DELAYS_MS[attempt]!);
+    }
+  };
+  tick();
+}
 
 // ───────── filesystem completion ─────────
 
@@ -620,6 +687,7 @@ app.get('/api/fs/read', (req, res) => {
 });
 
 const clientDist = path.resolve(__dirname, '../client');
+const mobileDist = path.resolve(__dirname, '../client-mobile');
 const isDevSource = clientDist.includes(`${path.sep}src${path.sep}`);
 if (isDevSource) {
   app.get('/', (_req, res) => {
@@ -628,11 +696,23 @@ if (isDevSource) {
       .type('text/plain')
       .send(
         'claude-maestro server is running in dev mode.\n' +
-          'Open the Vite client instead: http://localhost:4051\n' +
-          '(this port serves the built client only, after `npm run build`)\n',
+          'Open the Vite client instead: http://localhost:4051 (desktop)\n' +
+          '                          or  http://localhost:4052 (mobile)\n' +
+          '(this port serves the built clients only, after `npm run build`)\n',
+      );
+  });
+  app.get('/m', (_req, res) => {
+    res
+      .status(404)
+      .type('text/plain')
+      .send(
+        'mobile client is dev-only on this port.\n' +
+          'Open http://localhost:4052 instead, or run `npm run build` first.\n',
       );
   });
 } else {
+  // Mount mobile first so /m/* doesn't fall through to the root SPA.
+  app.use('/m', express.static(mobileDist));
   app.use(express.static(clientDist));
 }
 
@@ -662,9 +742,9 @@ function attach(ws: WebSocket, sessionId: string) {
     ws.close();
     return;
   }
-  s.subscribers.add(ws);
 
   let attached = false;
+  let mode: 'terminal' | 'chat' | null = null;
 
   ws.on('message', (raw) => {
     let msg: ClientMessage;
@@ -676,6 +756,8 @@ function attach(ws: WebSocket, sessionId: string) {
 
     if (msg.type === 'attach') {
       if (attached) return;
+      s.subscribers.add(ws);
+      mode = 'terminal';
       resizeSession(s, msg.cols, msg.rows);
       try {
         ensureSpawned(s);
@@ -702,17 +784,70 @@ function attach(ws: WebSocket, sessionId: string) {
       return;
     }
 
+    if (msg.type === 'attachChat') {
+      if (attached) return;
+      // Exclusive chat mode: no other subscriber may be connected.
+      if (s.subscribers.size > 0) {
+        const reply: ServerMessage = {
+          type: 'error',
+          code: 'chatLocked',
+          message: 'another client is connected to this session',
+        };
+        ws.send(JSON.stringify(reply));
+        ws.close();
+        return;
+      }
+      s.subscribers.add(ws);
+      s.chatSubscribers.add(ws);
+      mode = 'chat';
+      resizeSession(s, msg.cols, msg.rows);
+      try {
+        ensureSpawned(s);
+      } catch (err) {
+        const reply: ServerMessage = {
+          type: 'error',
+          message: `failed to spawn claude: ${(err as Error).message}`,
+        };
+        ws.send(JSON.stringify(reply));
+        s.subscribers.delete(ws);
+        s.chatSubscribers.delete(ws);
+        ws.close();
+        return;
+      }
+      if (!s.transcriptReader) s.transcriptReader = new TranscriptReader(s.id, s.cwd);
+      attached = true;
+      const history: ChatMessage[] = s.transcriptReader.readAll();
+      const reply: ServerMessage = {
+        type: 'chatAttached',
+        session: toInfo(s),
+        history,
+      };
+      ws.send(JSON.stringify(reply));
+      if (!s.alive && s.exitCode !== null) {
+        ws.send(JSON.stringify({ type: 'exit', code: s.exitCode } satisfies ServerMessage));
+      }
+      return;
+    }
+
     if (!attached) return;
 
     if (msg.type === 'input') {
+      if (process.env.MAESTRO_CHAT_DEBUG && mode === 'chat') {
+        console.log(`[chat-debug] ${s.id.slice(0,8)} input from chat: ${JSON.stringify(msg.data.slice(0,80))}`);
+      }
       writeToPty(s, msg.data);
     } else if (msg.type === 'resize') {
+      // Chat clients have no real cols/rows; ignore their resizes so they don't
+      // fight a (future) terminal client's geometry. Exclusive mode currently
+      // makes this moot, but keep the guard for when exclusivity loosens.
+      if (mode === 'chat') return;
       resizeSession(s, msg.cols, msg.rows);
     }
   });
 
   ws.on('close', () => {
     s.subscribers.delete(ws);
+    s.chatSubscribers.delete(ws);
   });
 }
 

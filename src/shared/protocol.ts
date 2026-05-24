@@ -37,8 +37,16 @@ export interface CreateSessionBody {
 
 export type ClientMessage =
   | { type: 'attach'; cols: number; rows: number }
+  | { type: 'attachChat'; cols: number; rows: number }
   | { type: 'input'; data: string }
   | { type: 'resize'; cols: number; rows: number };
+
+/** Structured chat message extracted from Claude's JSONL transcript.
+ *  `assistant_text` = a `type:'assistant'` entry's text-block content.
+ *  `user_text`      = a `type:'user'` entry's string content (history replay only — live user inputs are rendered locally on send to avoid double-displaying when the transcript flush echoes them back). */
+export type ChatMessage =
+  | { type: 'assistant_text'; text: string; ts: number }
+  | { type: 'user_text'; text: string; ts: number };
 
 export interface FsListEntry {
   name: string;
@@ -60,7 +68,9 @@ export type FsReadResponse =
 
 export type ServerMessage =
   | { type: 'attached'; session: SessionInfo; scrollback: string }
+  | { type: 'chatAttached'; session: SessionInfo; history: ChatMessage[] }
+  | { type: 'chatMessage'; message: ChatMessage }
   | { type: 'output'; data: string }
   | { type: 'activity'; activity: SessionActivity }
   | { type: 'exit'; code: number | null }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string; code?: 'chatLocked' };

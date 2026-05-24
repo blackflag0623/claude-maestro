@@ -41,3 +41,21 @@ Tracks known limitations, upstream quirks, and platform restrictions affecting c
 ## Platform-specific
 
 _(none recorded yet)_
+
+---
+
+## Mobile chat frontend (`/m`)
+
+### Permission prompts freeze the chat (MVP)
+
+- **Symptom:** When Claude requests a tool whose use is not pre-allowed (e.g. `Bash`, `Write`), it emits an interactive permission prompt to the TUI. The mobile chat client renders nothing for this — the chat appears to hang, and the user cannot answer the prompt from the phone.
+- **Root cause:** The mobile UI's only source of structured data is Claude's JSONL transcript file. The transcript records the *outcome* of permission decisions but not the interactive prompt itself, so there is nothing to render or respond to from the phone.
+- **Workaround:** Pre-allow common tools in the target repo's `.claude/settings.json` (`permissions.allow`) so Claude does not need to prompt. For full interactivity, attach a desktop terminal client to the same session (after closing the mobile tab, since chat mode is exclusive) to clear the prompt.
+
+### Mobile chat mode is exclusive — only one client per session
+
+- **Symptom:** Opening a session in the mobile chat UI while a desktop terminal is attached to the same session shows "another client is connected to this session". Same in reverse.
+- **Root cause:** Chat mode requires `s.subscribers.size === 0` at attach time. This is deliberate — terminal byte streams and structured chat frames cannot safely coexist for the same WS connection set, and we want predictable behavior over flexibility for MVP.
+- **Workaround:** Close other clients before opening chat. Refresh / re-open the mobile tab once the other client disconnects.
+
+---

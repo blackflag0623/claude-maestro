@@ -1,9 +1,10 @@
 import { defineConfig } from 'vite';
 
 export default defineConfig({
-  root: 'src/client',
+  root: 'src/client-mobile',
+  base: '/m/',
   server: {
-    port: 4051,
+    port: 4052,
     host: true,
     allowedHosts: ['.devtunnels.ms', 'localhost', '127.0.0.1'],
     proxy: {
@@ -19,7 +20,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: '../../dist/client',
+    outDir: '../../dist/client-mobile',
     emptyOutDir: true,
   },
 });

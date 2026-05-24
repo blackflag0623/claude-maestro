@@ -4,15 +4,17 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "concurrently -k -n server,client -c blue,magenta \"npm:dev:server\" \"npm:dev:client\"",
+    "dev": "concurrently -k -n server,client,mobile -c blue,magenta,green \"npm:dev:server\" \"npm:dev:client\" \"npm:dev:client:mobile\"",
     "dev:server": "tsx watch src/server/index.ts",
     "dev:client": "vite",
-    "build": "vite build && tsc -p tsconfig.server.json",
+    "dev:client:mobile": "vite --config vite.mobile.config.ts",
+    "build": "vite build && vite build --config vite.mobile.config.ts && tsc -p tsconfig.server.json",
     "start": "node dist/server/index.js"
   },
   "dependencies": {
     "@lydell/node-pty": "^1.1.0",
     "express": "^4.21.1",
+    "marked": "^14.1.4",
     "ws": "^8.18.0"
   },
   "devDependencies": {
