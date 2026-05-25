@@ -387,10 +387,22 @@ type DragRef =
   | { kind: 'node'; serverId: string; sessionId: string };
 
 let dragging: DragRef | null = null;
+// Snapshot used to restore the DOM order if a drag is cancelled (Esc, drop
+// outside any valid target). We do NOT mutate state during dragover — only
+// the DOM moves in real time. On drop, the existing reorder helpers commit
+// state from the drag target reference; on cancel, we put children back.
+let dragOriginalOrder: HTMLElement[] | null = null;
+let dragOriginalParent: HTMLElement | null = null;
+let dragDropCommitted = false;
 
 function attachDrag(el: HTMLElement, ref: DragRef) {
   el.addEventListener('dragstart', (e) => {
     dragging = ref;
+    dragDropCommitted = false;
+    dragOriginalParent = el.parentElement;
+    dragOriginalOrder = dragOriginalParent ? (Array.from(dragOriginalParent.children) as HTMLElement[]) : null;
+    // The hover popup would be in the way of a server drag.
+    closeServerPopup();
     el.classList.add('is-dragging');
     e.dataTransfer?.setData('text/plain', JSON.stringify(ref));
     if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
@@ -398,14 +410,33 @@ function attachDrag(el: HTMLElement, ref: DragRef) {
   el.addEventListener('dragend', () => {
     el.classList.remove('is-dragging');
     document.querySelectorAll('.is-drop-target').forEach((n) => n.classList.remove('is-drop-target'));
+    // Cancelled drag (no successful drop fired): restore the original DOM order
+    // so the visual position matches the unchanged state.
+    if (!dragDropCommitted && dragOriginalOrder && dragOriginalParent) {
+      for (const child of dragOriginalOrder) dragOriginalParent.appendChild(child);
+    }
     dragging = null;
+    dragOriginalOrder = null;
+    dragOriginalParent = null;
+    dragDropCommitted = false;
   });
   el.addEventListener('dragover', (e) => {
     if (!dragging || dragging.kind !== ref.kind) return;
     if (ref.kind === 'node' && dragging.kind === 'node' && dragging.serverId !== ref.serverId) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
-    el.classList.add('is-drop-target');
+    // Live DOM-only reorder: slide the dragged <li> to the appropriate side of
+    // this hover target so siblings visibly shift in real time. State is left
+    // untouched until drop; on cancel we revert via the snapshot above.
+    const parent = el.parentElement;
+    if (!parent) return;
+    const dragged = parent.querySelector<HTMLElement>('.is-dragging');
+    if (!dragged || dragged === el) return;
+    const before = isAbove(e, el);
+    const anchor = before ? el : el.nextElementSibling;
+    if (dragged !== anchor && dragged.nextElementSibling !== anchor) {
+      parent.insertBefore(dragged, anchor);
+    }
   });
   el.addEventListener('dragleave', () => el.classList.remove('is-drop-target'));
   el.addEventListener('drop', (e) => {
@@ -413,6 +444,7 @@ function attachDrag(el: HTMLElement, ref: DragRef) {
     if (!dragging || dragging.kind !== ref.kind) return;
     e.preventDefault();
     e.stopPropagation();
+    dragDropCommitted = true;
     const before = isAbove(e, el);
     if (dragging.kind === 'server' && ref.kind === 'server') {
       reorderServer(dragging.serverId, ref.serverId, before);
