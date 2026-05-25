@@ -271,10 +271,13 @@ function wireServerPopup(li: HTMLElement): void {
   const row = li.querySelector<HTMLElement>('.server__row');
   const popup = li.querySelector<HTMLElement>('.server__popup');
   if (!row || !popup) return;
-  row.addEventListener('mouseenter', () => openServerPopup(li));
-  row.addEventListener('mouseleave', () => scheduleClose());
-  row.addEventListener('focusin', () => openServerPopup(li));
-  row.addEventListener('focusout', (e) => {
+  // Bind to the whole .server li (row + node-list) so the popup stays open
+  // while the cursor moves over any agent node beneath the row. The popup
+  // is still anchored to .server__row's bounding box.
+  li.addEventListener('mouseenter', () => openServerPopup(li));
+  li.addEventListener('mouseleave', () => scheduleClose());
+  li.addEventListener('focusin', () => openServerPopup(li));
+  li.addEventListener('focusout', (e) => {
     const next = (e as FocusEvent).relatedTarget as Node | null;
     if (next && (li.contains(next) || popup.contains(next))) return;
     scheduleClose();
