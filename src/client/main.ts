@@ -395,6 +395,40 @@ let dragOriginalOrder: HTMLElement[] | null = null;
 let dragOriginalParent: HTMLElement | null = null;
 let dragDropCommitted = false;
 
+/** FLIP-animate a reorder inside `parent`. Snapshot rects, run the mutation
+ *  (which moves children around in DOM order), then for each sibling whose
+ *  position changed, apply the inverted delta as a transform and animate it
+ *  back to zero via the CSS transition on `transform`. The dragged element
+ *  is excluded so its position doesn't fight the browser-rendered drag ghost. */
+function flipReorder(parent: HTMLElement, doMove: () => void, exclude: HTMLElement | null): void {
+  const siblings = (Array.from(parent.children) as HTMLElement[]).filter((el) => el !== exclude);
+  const firstRects = new Map<HTMLElement, DOMRect>();
+  for (const el of siblings) firstRects.set(el, el.getBoundingClientRect());
+  // Clear any in-flight transforms so the post-move measurement reflects the
+  // natural new layout, not a transform-offset position from a prior FLIP.
+  for (const el of siblings) {
+    el.style.transition = 'none';
+    el.style.transform = '';
+  }
+  doMove();
+  // Force layout so the next getBoundingClientRect reads the moved positions.
+  void parent.offsetHeight;
+  for (const el of siblings) {
+    const first = firstRects.get(el)!;
+    const last = el.getBoundingClientRect();
+    const dy = first.top - last.top;
+    if (Math.abs(dy) < 0.5) continue;
+    el.style.transform = `translateY(${dy}px)`;
+  }
+  // Commit the transforms before re-enabling transitions; otherwise the
+  // browser will collapse the two style writes and skip the animation.
+  void parent.offsetHeight;
+  for (const el of siblings) {
+    el.style.transition = '';
+    el.style.transform = '';
+  }
+}
+
 function attachDrag(el: HTMLElement, ref: DragRef) {
   el.addEventListener('dragstart', (e) => {
     dragging = ref;
@@ -413,7 +447,9 @@ function attachDrag(el: HTMLElement, ref: DragRef) {
     // Cancelled drag (no successful drop fired): restore the original DOM order
     // so the visual position matches the unchanged state.
     if (!dragDropCommitted && dragOriginalOrder && dragOriginalParent) {
-      for (const child of dragOriginalOrder) dragOriginalParent.appendChild(child);
+      const parent = dragOriginalParent;
+      const order = dragOriginalOrder;
+      flipReorder(parent, () => { for (const child of order) parent.appendChild(child); }, el);
     }
     dragging = null;
     dragOriginalOrder = null;
@@ -425,9 +461,9 @@ function attachDrag(el: HTMLElement, ref: DragRef) {
     if (ref.kind === 'node' && dragging.kind === 'node' && dragging.serverId !== ref.serverId) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
-    // Live DOM-only reorder: slide the dragged <li> to the appropriate side of
-    // this hover target so siblings visibly shift in real time. State is left
-    // untouched until drop; on cancel we revert via the snapshot above.
+    // Live DOM-only reorder with a FLIP animation so siblings slide smoothly
+    // instead of snapping. State is left untouched until drop; on cancel we
+    // revert via the snapshot above (also FLIP-animated).
     const parent = el.parentElement;
     if (!parent) return;
     const dragged = parent.querySelector<HTMLElement>('.is-dragging');
@@ -435,7 +471,7 @@ function attachDrag(el: HTMLElement, ref: DragRef) {
     const before = isAbove(e, el);
     const anchor = before ? el : el.nextElementSibling;
     if (dragged !== anchor && dragged.nextElementSibling !== anchor) {
-      parent.insertBefore(dragged, anchor);
+      flipReorder(parent, () => parent.insertBefore(dragged, anchor), dragged);
     }
   });
   el.addEventListener('dragleave', () => el.classList.remove('is-drop-target'));

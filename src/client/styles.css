@@ -217,6 +217,8 @@ button { font: inherit; color: inherit; }
   border-top: 1px solid var(--ink);
   padding: 12px 14px 10px;
   position: relative;
+  /* `transform` transition powers the FLIP slide animation during drag-reorder. */
+  transition: background 80ms linear, transform 180ms cubic-bezier(0.2, 0.7, 0.3, 1);
 }
 .server:first-child { border-top: 0; }
 .server__row {
@@ -373,7 +375,8 @@ button { font: inherit; color: inherit; }
   border: 1px solid transparent;
   cursor: pointer;
   font-size: 13px;
-  transition: background 80ms linear;
+  /* `transform` transition powers the FLIP slide animation during drag-reorder. */
+  transition: background 80ms linear, transform 180ms cubic-bezier(0.2, 0.7, 0.3, 1);
 }
 .node:hover { background: var(--bone-2); }
 .node[aria-current="true"] {
