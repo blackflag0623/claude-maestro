@@ -60,20 +60,49 @@ button { font: inherit; color: inherit; }
   display: grid;
   grid-template-columns: var(--sidebar-w, 232px) 1fr;
   height: 100vh;
-  transition: grid-template-columns 220ms cubic-bezier(.7, .1, .2, 1);
 }
 .app[data-sidebar="collapsed"] { --sidebar-w: 0px; }
 .app[data-sidebar="collapsed"] .sidebar {
-  /* Remove from tab order + pointer hits while the wipe completes.
-     Visibility transitions with a 220ms delay so it hides at the end of
-     the column-shrink, and shows instantly on expand. */
+  /* Remove from tab order + pointer hits once the sidebar is hidden. */
   visibility: hidden;
   pointer-events: none;
-  transition: visibility 0s linear 220ms;
 }
 .app[data-sidebar="expanded"] .sidebar {
   visibility: visible;
-  transition: visibility 0s linear 0s;
+}
+
+/* Sidebar toggle animation.
+   The previous approach animated `grid-template-columns`, which forces a full
+   grid relayout (and an xterm/canvas repaint inside .main) on every frame and
+   feels janky on slower machines. The new approach uses the View Transitions
+   API: the browser snapshots the layout before/after, then crossfades the
+   snapshots on a compositor layer — no per-frame relayout, and the heavy
+   .main contents only re-layout once when the snapshots are composed.
+
+   We name .sidebar and .main individually so each gets its own animation
+   pair. The sidebar snapshot slides; the main snapshot crossfades to its
+   new size. */
+.sidebar { view-transition-name: sidebar; }
+.main { view-transition-name: stage; }
+
+::view-transition-group(sidebar),
+::view-transition-group(stage) {
+  animation-duration: 200ms;
+  animation-timing-function: cubic-bezier(.7, .1, .2, 1);
+}
+::view-transition-old(sidebar) {
+  animation: 200ms cubic-bezier(.7, .1, .2, 1) both vt-sidebar-out;
+}
+::view-transition-new(sidebar) {
+  animation: 200ms cubic-bezier(.7, .1, .2, 1) both vt-sidebar-in;
+}
+@keyframes vt-sidebar-out {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-100%); }
+}
+@keyframes vt-sidebar-in {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(0); }
 }
 /* Prevent the animation from firing on initial paint. */
 .app[data-boot="1"] { transition: none; }

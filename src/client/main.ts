@@ -1004,7 +1004,18 @@ function applySidebarState() {
 function toggleSidebar() {
   state.sidebarCollapsed = !state.sidebarCollapsed;
   persist();
-  applySidebarState();
+  // Use the View Transitions API when available so the layout shift is
+  // composited as a snapshot crossfade/slide instead of relayouting the
+  // grid (and repainting xterm) on every frame. Falls back to an instant
+  // snap on browsers without the API.
+  const startVT = (document as Document & {
+    startViewTransition?: (cb: () => void) => unknown;
+  }).startViewTransition;
+  if (typeof startVT === 'function') {
+    startVT.call(document, () => applySidebarState());
+  } else {
+    applySidebarState();
+  }
 }
 
 $btnSidebar.addEventListener('click', toggleSidebar);
