@@ -7,8 +7,10 @@
 // activity and chat updates come from tailing that file.
 //
 // Invocation shape (verified against `copilot --help` 1.0.55+):
-//   - new:    `copilot --session-id <uuid>`
-//   - resume: `copilot --resume <uuid>`
+//   - new:    `copilot --session-id=<uuid>`
+//   - resume: `copilot --resume=<uuid>`
+// The `=` form is REQUIRED — copilot's parser treats `--session-id <uuid>`
+// (space-separated) as a boolean flag plus a positional resume name.
 //
 // Binary configuration:
 //   MAESTRO_COPILOT_BIN          path to the executable (default: `copilot`).
@@ -325,7 +327,10 @@ export const copilotStrategy: AgentStrategy = {
     const effectiveMode: SpawnMode =
       mode === 'new' && fs.existsSync(eventsPathFor(target.id)) ? 'resume' : mode;
     const sessionFlag = effectiveMode === 'new' ? '--session-id' : '--resume';
-    const args = [...COPILOT_PREFIX_ARGS, sessionFlag, target.id];
+    // Copilot's CLI parser requires `--flag=value`, not `--flag value`. Passing
+    // them as two tokens makes copilot treat the uuid as a positional resume
+    // name, which fails with "No session, task, or name matched '<uuid>'".
+    const args = [...COPILOT_PREFIX_ARGS, `${sessionFlag}=${target.id}`];
     try {
       return pty.spawn(COPILOT_BIN, args, {
         name: 'xterm-256color',
