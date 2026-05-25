@@ -1,4 +1,5 @@
-import { MaestroApi } from '../client/api';
+import { MaestroApi } from '../client-shared/api';
+import { escapeHtml as escape } from '../client-shared/html';
 import {
   loadState,
   saveState,
@@ -105,10 +106,4 @@ export function renderServerPicker(root: HTMLElement, cb: ServerPickerCallbacks)
   });
 
   paint();
-}
-
-function escape(s: string): string {
-  return s.replace(/[&<>"']/g, (c) =>
-    c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : '&#39;',
-  );
 }

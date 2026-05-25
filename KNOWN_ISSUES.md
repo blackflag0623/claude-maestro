@@ -44,6 +44,22 @@ _(none recorded yet)_
 
 ---
 
+## Agent integrations
+
+### Copilot CLI launched via the `agency` wrapper
+
+- **Symptom:** Setting `MAESTRO_COPILOT_BIN=agency` alone fails — `agency` is a launcher and needs the `copilot` subcommand before any other flag.
+- **Root cause:** The Copilot strategy invokes the configured binary with `[--session-id|--resume, <uuid>]` directly. To use a wrapper that expects a subcommand, you must prefix that subcommand as a separate token.
+- **Workaround:** Use the two-variable form: `MAESTRO_COPILOT_BIN=agency` and `MAESTRO_COPILOT_PREFIX_ARGS=copilot`. `MAESTRO_COPILOT_BIN` is *not* whitespace-split (paths with spaces are honored); `MAESTRO_COPILOT_PREFIX_ARGS` *is* whitespace-split and inserted between the binary and the session flag.
+
+### Copilot CLI mobile chat: tool-only turns appear silent
+
+- **Symptom:** When Copilot answers with only tool calls (no `assistant.message` text), nothing is added to the mobile chat history for that turn.
+- **Root cause:** The Copilot reader extracts `assistant.message.data.content` (text) and `user.message.data.content` only; tool calls, system messages, and thinking blocks are intentionally skipped for MVP.
+- **Workaround:** Open the session from the desktop terminal portal to see the full transcript including tool invocations. Mapping `tool.execution_complete` events into chat bubbles is a future enhancement.
+
+---
+
 ## Mobile chat frontend (`/m`)
 
 ### Permission prompts freeze the chat (MVP)

@@ -1,0 +1,31 @@
+/* Design tokens shared between desktop (src/client) and mobile (src/client-mobile).
+ *
+ * Brutalist control-room vocabulary: bone background, hard 2px black rules,
+ * JetBrains Mono + Fraunces, single acid-lime accent. Per CLAUDE.md, both
+ * clients should "preserve" this vocabulary; this file is the single source
+ * of truth so they actually do.
+ *
+ * Local extensions (e.g. mobile's --bubble-* chat tokens, desktop's --bone-2 /
+ * --bone-3 sidebar tints) live in each client's own styles.css and may
+ * reference these tokens. Do not duplicate tokens defined here. */
+
+:root {
+  /* ─ canvas ─ */
+  --bone: #ece7dd;
+  --ink: #0a0a0a;
+  --ink-2: #1a1a1a;
+
+  /* ─ structure ─ */
+  --rule: #0a0a0a;
+  --muted: #6b6657;
+
+  /* ─ accents ─ */
+  --lime: #c6ff3d;
+  --lime-ink: #0a0a0a;
+  --warn: #ff8a3d;
+  --err: #ff3d3d;
+
+  /* ─ type ─ */
+  --mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Cascadia Mono", Menlo, monospace;
+  --serif: "Fraunces", Georgia, serif;
+}

@@ -1,10 +1,20 @@
-import type { SessionInfo } from '../shared/protocol';
-import { MaestroApi } from '../client/api';
+import type { AgentType, SessionInfo } from '../shared/protocol';
+import { AGENT_TYPES } from '../shared/protocol';
+import { MaestroApi } from '../client-shared/api';
+import { escapeHtml as escape } from '../client-shared/html';
 import type { MobileServerEntry } from './mobile-state';
 
 export interface SessionPickerCallbacks {
   onPickSession: (sessionId: string) => void;
   onBack: () => void;
+}
+
+function agentLabel(a: AgentType): string {
+  return a === 'copilot' ? 'GitHub Copilot CLI' : 'Claude Code';
+}
+
+function agentBadge(a: AgentType): string {
+  return a === 'copilot' ? 'cop' : 'cla';
 }
 
 export function renderSessionPicker(
@@ -27,6 +37,12 @@ export function renderSessionPicker(
       </section>
       <section class="block">
         <h3 class="block__h">new session</h3>
+        <div class="row">
+          <select class="input input--select" id="new-agent" aria-label="agent">
+            <option value="claude" selected>Claude Code</option>
+            <option value="copilot">GitHub Copilot CLI</option>
+          </select>
+        </div>
         <div class="row">
           <input class="input" id="new-cwd" placeholder="/path/to/repo" spellcheck="false" autocomplete="off" />
           <button class="btn btn--primary" id="new-btn">spawn</button>
@@ -59,9 +75,13 @@ export function renderSessionPicker(
     for (const s of sessions) {
       const li = document.createElement('li');
       li.className = 'list__row';
+      const agent = s.agentType ?? 'claude';
       li.innerHTML = `
-        <button class="list__main" data-id="${s.id}">
-          <span class="list__title">${escape(s.title)}</span>
+        <button class="list__main" data-id="${s.id}" data-agent="${agent}">
+          <span class="list__title">
+            <span class="agent-badge" title="${escape(agentLabel(agent))}">${escape(agentBadge(agent))}</span>
+            ${escape(s.title)}
+          </span>
           <span class="list__sub">${escape(s.cwd)}</span>
           <span class="list__meta">${s.attached ? 'live' : 'dormant'} · ${s.activity}</span>
         </button>
@@ -78,6 +98,10 @@ export function renderSessionPicker(
 
   root.querySelector<HTMLButtonElement>('#new-btn')!.addEventListener('click', async () => {
     const cwd = root.querySelector<HTMLInputElement>('#new-cwd')!.value.trim();
+    const rawAgent = root.querySelector<HTMLSelectElement>('#new-agent')!.value;
+    const agentType: AgentType = (AGENT_TYPES as readonly string[]).includes(rawAgent)
+      ? (rawAgent as AgentType)
+      : 'claude';
     if (!cwd) {
       errEl.textContent = 'cwd is required';
       return;
@@ -86,7 +110,7 @@ export function renderSessionPicker(
     btn.disabled = true;
     errEl.textContent = '';
     try {
-      const s = await api.create({ cwd });
+      const s = await api.create({ cwd, agentType });
       cb.onPickSession(s.id);
     } catch (e) {
       errEl.textContent = (e as Error).message;
@@ -95,10 +119,4 @@ export function renderSessionPicker(
   });
 
   refresh();
-}
-
-function escape(s: string): string {
-  return s.replace(/[&<>"']/g, (c) =>
-    c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : '&#39;',
-  );
 }

@@ -1,10 +1,14 @@
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
+import { WebLinksAddon } from '@xterm/addon-web-links';
+import { SearchAddon } from '@xterm/addon-search';
+import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 import type { ClientMessage, ServerMessage, SessionInfo, SessionActivity } from '../shared/protocol';
-import type { MaestroApi } from './api';
+import type { MaestroApi } from '../client-shared/api';
 import { buildCursorIndicator, type CursorIndicator } from './cursor-indicator';
+import { buildSearchOverlay, type SearchOverlay } from './search-overlay';
 
 export type NodeStatus = 'connecting' | 'live' | 'reconnecting' | 'exited' | 'error';
 
@@ -27,6 +31,9 @@ export class TerminalNode {
   readonly el: HTMLDivElement;
   readonly term: Terminal;
   private readonly fit = new FitAddon();
+  private readonly search = new SearchAddon();
+  private readonly serializer = new SerializeAddon();
+  private readonly searchOverlay: SearchOverlay;
   private webgl: WebglAddon | null = null;
   private ws: WebSocket | null = null;
   private reconnectDelay = 500;
@@ -82,6 +89,12 @@ export class TerminalNode {
       },
     });
     this.term.loadAddon(this.fit);
+    this.term.loadAddon(this.search);
+    this.term.loadAddon(this.serializer);
+    // Web-links: hover-underline + Ctrl/Cmd+click to open in a new tab.
+    // Default URL regex covers `http(s)://` only — enough for what Claude
+    // typically prints (doc links, PRs, issues).
+    this.term.loadAddon(new WebLinksAddon());
     this.term.open(this.el);
     // WebGL renderer — falls back to DOM on context loss.
     try {
@@ -97,6 +110,8 @@ export class TerminalNode {
     }
     this.indicator = buildCursorIndicator();
     this.el.appendChild(this.indicator.el);
+    this.searchOverlay = buildSearchOverlay(this.search);
+    this.el.appendChild(this.searchOverlay.el);
 
     // All paste paths funnel through pasteText() which wraps content in
     // bracketed-paste markers. Keyboard and DOM entry points coordinate
@@ -193,6 +208,55 @@ export class TerminalNode {
     try {
       this.fit.fit();
     } catch {}
+  }
+
+  /** Toggle the per-node find overlay. Called from the global ⌘/Ctrl+F handler. */
+  toggleSearch() {
+    if (this.searchOverlay.isOpen()) this.searchOverlay.close();
+    else this.searchOverlay.open();
+  }
+
+  /** Serialize the current buffer (scrollback + viewport) to plain text.
+   *  ANSI escape sequences are preserved so the file replays accurately in
+   *  any terminal; strip with `data.replace(/\x1b\[[0-9;]*m/g, '')` if a
+   *  plain dump is needed. */
+  serialize(): string {
+    return this.serializer.serialize();
+  }
+
+  /** Serialize the current buffer to a standalone HTML document with ANSI
+   *  colors rendered as inline styles. The raw addon output is just
+   *  `<html><body><pre>...</pre></body></html>` (no DOCTYPE, no charset, no
+   *  page styles) — we wrap it with a proper document shell so the saved
+   *  file opens in a browser with the same dark bg + brand font as the
+   *  live terminal, while leaving the addon's inline-styled spans intact. */
+  serializeAsHTML(title = 'maestro snapshot'): string {
+    const inner = this.serializer.serializeAsHTML();
+    // Extract just the <pre>…</pre> block. The addon wraps it in
+    // <html><body><!--StartFragment--><pre>…</pre><!--EndFragment-->
+    // </body></html>; we want the <pre> so we can put it inside our own
+    // document shell. Fall back to the full inner string if the shape
+    // ever changes upstream.
+    const preMatch = inner.match(/<pre[\s\S]*<\/pre>/);
+    const body = preMatch ? preMatch[0] : inner;
+    const safeTitle = title.replace(/[<&]/g, (c) => (c === '<' ? '&lt;' : '&amp;'));
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>${safeTitle}</title>
+<style>
+  html, body { margin: 0; padding: 0; background: ${TERM_BG}; color: ${TERM_FG}; }
+  body { padding: 16px; font-family: "JetBrains Mono", Consolas, "Cascadia Mono", Menlo, monospace; font-size: 13px; line-height: 1.2; }
+  pre { margin: 0; white-space: pre; font: inherit; }
+  ::selection { background: ${TERM_LIME}44; }
+</style>
+</head>
+<body>
+${body}
+</body>
+</html>
+`;
   }
 
   destroy() {

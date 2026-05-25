@@ -1,19 +1,11 @@
+@import url('../client-shared/tokens.css');
+
 :root {
-  --bone: #ece7dd;
+  /* Client-local extensions of the shared palette. */
   --bone-2: #e2dccf;
   --bone-3: #d6cfbe;
-  --ink: #0a0a0a;
-  --ink-2: #1a1a1a;
-  --rule: #0a0a0a;
-  --muted: #6b6657;
-  --lime: #c6ff3d;
-  --lime-ink: #0a0a0a;
-  --warn: #ff8a3d;
-  --err: #ff3d3d;
   --sky: #57c7ff;
   --grain: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.06 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
-  --mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Cascadia Mono", Menlo, monospace;
-  --serif: "Fraunces", Georgia, serif;
 }
 
 * { box-sizing: border-box; }
@@ -40,10 +32,6 @@ button { font: inherit; color: inherit; }
 @keyframes slab-in {
   0% { transform: translateY(8px); opacity: 0; clip-path: inset(0 100% 0 0); }
   100% { transform: translateY(0); opacity: 1; clip-path: inset(0 0 0 0); }
-}
-@keyframes slide-x {
-  from { transform: translateX(calc(var(--reveal, 0) * -1 * 24px) + 0); opacity: 0; }
-  to { transform: translateX(0); opacity: 1; }
 }
 @keyframes fade-up {
   from { transform: translateY(6px); opacity: 0; }
@@ -360,6 +348,22 @@ button { font: inherit; color: inherit; }
 .node[data-state="live"] .node__bar { background: var(--lime); }
 .node[data-state="reconnecting"] .node__bar { background: var(--warn); animation: blink 800ms steps(2,end) infinite; }
 .node[data-state="exited"] .node__bar { background: var(--err); }
+.node__agent {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 8.5px;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 2px 4px;
+  border: 1px solid var(--ink);
+  background: var(--bone-2);
+  color: var(--ink);
+}
+.node[data-agent="copilot"] .node__agent {
+  background: var(--ink);
+  color: var(--bone);
+}
 .node__title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node__activity {
   width: 7px;
@@ -599,6 +603,70 @@ button { font: inherit; color: inherit; }
   opacity: 0.06;
 }
 
+/* Find-in-node overlay. Pinned top-right inside the terminal pane, offset
+   left of the chase indicator. Brutalist vocabulary: bone-on-ink panel,
+   2px black rule, mono input. Lime focus accent. */
+.search-overlay {
+  position: absolute;
+  top: 6px;
+  right: 44px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
+  background: var(--bone);
+  border: 2px solid var(--ink);
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1;
+  box-shadow: 4px 4px 0 0 var(--ink);
+}
+.search-overlay[hidden] { display: none; }
+.search-overlay__input {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  padding: 6px 8px;
+  width: 180px;
+  outline: none;
+}
+.search-overlay__input::placeholder {
+  color: color-mix(in srgb, var(--ink) 55%, transparent);
+}
+.search-overlay__input:focus {
+  background: color-mix(in srgb, var(--lime) 18%, var(--bone));
+}
+.search-overlay__count {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  border-left: 1px solid color-mix(in srgb, var(--ink) 25%, transparent);
+  color: color-mix(in srgb, var(--ink) 70%, transparent);
+  min-width: 40px;
+  justify-content: center;
+  font-variant-numeric: tabular-nums;
+}
+.search-overlay__btn {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-left: 1px solid color-mix(in srgb, var(--ink) 25%, transparent);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  padding: 0 8px;
+  cursor: pointer;
+  min-width: 24px;
+}
+.search-overlay__btn:hover {
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+}
+.search-overlay__btn:active {
+  background: var(--lime);
+}
+
 /* empty state */
 .empty {
   position: absolute;
@@ -803,7 +871,8 @@ button { font: inherit; color: inherit; }
   text-transform: uppercase;
   color: var(--muted);
 }
-.field input {
+.field input,
+.field select {
   font-family: var(--mono);
   font-size: 13px;
   padding: 9px 10px;
@@ -813,7 +882,8 @@ button { font: inherit; color: inherit; }
   color: var(--ink);
 }
 .field input::placeholder { color: var(--muted); opacity: .8; }
-.field input:focus { background: var(--bone); box-shadow: inset 0 0 0 2px var(--lime); }
+.field input:focus,
+.field select:focus { background: var(--bone); box-shadow: inset 0 0 0 2px var(--lime); }
 .field__hint {
   margin: 8px 18px 0;
   font-size: 11px;
@@ -1130,6 +1200,7 @@ button { font: inherit; color: inherit; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 10px;
   flex-shrink: 0;
 }
 .layout-switch {
@@ -1156,6 +1227,52 @@ button { font: inherit; color: inherit; }
 .layout-switch button[aria-current="true"] {
   background: var(--ink);
   color: var(--lime);
+}
+
+/* Action buttons for the focused node (find / snapshot). Same vocabulary as
+   layout-switch — a bordered button group — but text-labeled so the action
+   is self-describing. Visible in every layout (the pane head bar is hidden
+   in single-pane mode, so these are the only discoverable surface). When
+   no node is focused the entire group goes inert via [disabled]. */
+.node-actions {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1.5px solid var(--ink);
+  background: var(--bone-2);
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: lowercase;
+}
+.node-actions button {
+  background: transparent;
+  border: 0;
+  border-right: 1px solid var(--ink);
+  padding: 0 8px;
+  min-height: 22px;
+  cursor: pointer;
+  color: var(--muted);
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 80ms linear, color 80ms linear;
+}
+.node-actions button:last-child { border-right: 0; }
+.node-actions button:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--bone);
+}
+.node-actions button:active:not(:disabled) {
+  background: var(--ink);
+  color: var(--lime);
+}
+.node-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
 }
 
 /* ───────── pane: files toggle + split body ───────── */

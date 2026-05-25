@@ -1,16 +1,6 @@
-import type { MaestroApi } from './api';
+import type { MaestroApi } from '../client-shared/api';
 import type { FsListEntry } from '../shared/protocol';
-
-const HTML_ESCAPES: Record<string, string> = {
-  '&': '&amp;',
-  '<': '&lt;',
-  '>': '&gt;',
-  '"': '&quot;',
-  "'": '&#39;',
-};
-function esc(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]!);
-}
+import { escapeHtml as esc } from '../client-shared/html';
 
 function joinRel(base: string, name: string): string {
   if (!base) return name;

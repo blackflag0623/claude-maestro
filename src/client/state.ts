@@ -10,6 +10,10 @@ export interface NodeRef {
   serverId: string;
   sessionId: string;
   title: string;
+  /** Cached so the sidebar can render the agent badge before the live
+   *  SessionInfo arrives from the server. Optional for backward-compat with
+   *  state persisted before the agent abstraction. */
+  agentType?: import('../shared/protocol').AgentType;
 }
 
 export type LayoutMode = 'single' | 'split-2' | 'grid-4';
@@ -43,6 +47,9 @@ export interface PersistedState {
   // Last working directory the user picked when spawning a node on a given
   // server, so the new-node dialog can pre-fill it next time.
   lastCwd: Record<string, string>;
+  // Last agent type the user picked when spawning a node on a given server,
+  // mirroring lastCwd. Defaults to 'claude' for servers with no entry.
+  lastAgentType: Record<string, import('../shared/protocol').AgentType>;
 }
 
 const KEY = 'maestro:state:v1';
@@ -59,11 +66,18 @@ const empty: PersistedState = {
   sidebarCollapsed: false,
   knownNodes: {},
   lastCwd: {},
+  lastAgentType: {},
 };
 
 export function loadState(): PersistedState {
+  let raw: string | null;
   try {
-    const raw = localStorage.getItem(KEY);
+    raw = localStorage.getItem(KEY);
+  } catch {
+    // Safari private mode, sandboxed iframe, etc. — degrade to in-memory.
+    return structuredClone(empty);
+  }
+  try {
     if (!raw) return structuredClone(empty);
     const parsed = JSON.parse(raw) as Partial<PersistedState> & { activeNode?: NodeRef | null };
     const merged: PersistedState = { ...structuredClone(empty), ...parsed };
@@ -101,7 +115,12 @@ export function loadState(): PersistedState {
 }
 
 export function saveState(s: PersistedState) {
-  localStorage.setItem(KEY, JSON.stringify(s));
+  try {
+    localStorage.setItem(KEY, JSON.stringify(s));
+  } catch {
+    // Storage may be unavailable (Safari private mode, quota exceeded, sandbox).
+    // We silently drop — state will re-derive on next reload from server data.
+  }
 }
 
 export function uuid(): string {
@@ -169,10 +188,18 @@ export function reconcileNodes(
   live: SessionInfo[],
 ): PersistedState {
   const liveIds = new Set(live.map((s) => s.id));
+  const liveById = new Map(live.map((s) => [s.id, s] as const));
   const known = (state.knownNodes[serverId] ?? []).filter((n) => liveIds.has(n.sessionId));
+  // Backfill agentType on existing refs whenever the server reports it; this
+  // upgrades pre-migration knownNodes entries the first time we hear from the
+  // server again.
+  for (const ref of known) {
+    const info = liveById.get(ref.sessionId);
+    if (info && ref.agentType !== info.agentType) ref.agentType = info.agentType;
+  }
   for (const s of live) {
     if (!known.some((k) => k.sessionId === s.id)) {
-      known.push({ serverId, sessionId: s.id, title: s.title });
+      known.push({ serverId, sessionId: s.id, title: s.title, agentType: s.agentType });
     }
   }
   const activeNodes = state.activeNodes.map((n) =>

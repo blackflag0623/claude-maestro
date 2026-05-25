@@ -94,6 +94,32 @@
                 </svg>
               </button>
             </div>
+            <div class="node-actions" id="node-actions" role="group" aria-label="actions on focused node">
+              <button
+                type="button"
+                data-act="find"
+                title="find in node (⌘F / Ctrl+F)"
+                aria-label="find in node"
+                aria-keyshortcuts="Control+F Meta+F"
+                disabled
+              >find</button>
+              <button
+                type="button"
+                data-act="save-txt"
+                title="snapshot as .txt (⌘⇧S / Ctrl+Shift+S)"
+                aria-label="snapshot as text"
+                aria-keyshortcuts="Control+Shift+S Meta+Shift+S"
+                disabled
+              >↓&nbsp;txt</button>
+              <button
+                type="button"
+                data-act="save-html"
+                title="snapshot as .html (⌘⇧H / Ctrl+Shift+H)"
+                aria-label="snapshot as html"
+                aria-keyshortcuts="Control+Shift+H Meta+Shift+H"
+                disabled
+              >↓&nbsp;html</button>
+            </div>
           </div>
           <div class="topbar__status">
             <span class="status" id="status" data-state="idle">
@@ -131,6 +157,12 @@
               <span>⌘k — new node</span>
               <span>·</span>
               <span>⌘v — paste</span>
+              <span>·</span>
+              <span>⌘f — find</span>
+              <span>·</span>
+              <span>⌘⇧s — save .txt</span>
+              <span>·</span>
+              <span>⌘⇧h — save .html</span>
             </div>
           </div>
         </div>
@@ -180,6 +212,14 @@
           <input name="title" maxlength="40" placeholder="payments-refactor, scratch, ..." autocomplete="off" />
         </label>
         <label class="field">
+          <span class="field__label">agent</span>
+          <select name="agentType" autocomplete="off">
+            <option value="claude" selected>Claude Code</option>
+            <option value="copilot">GitHub Copilot CLI</option>
+          </select>
+          <span class="field__sub">which CLI agent backs this node. immutable after creation.</span>
+        </label>
+        <label class="field">
           <span class="field__label">working directory</span>
           <input
             name="cwd"
@@ -188,7 +228,7 @@
             autocomplete="off"
             spellcheck="false"
           />
-          <span class="field__sub">claude is launched here. must exist on the server.</span>
+          <span class="field__sub">the agent is launched here. must exist on the server.</span>
         </label>
         <p class="field__hint" id="node-error"></p>
         <footer class="modal__foot">

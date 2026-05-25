@@ -1,11 +1,9 @@
+@import url('../client-shared/tokens.css');
+
 :root {
-  --bone: #f4f1e8;
-  --ink: #0a0a0a;
-  --ink-2: #2a2a28;
-  --rule: #0a0a0a;
-  --lime: #c6ff3d;
-  --dim: #6a665c;
-  --warn: #b54a00;
+  /* Client-local extensions for chat bubbles. Mobile inherits --bone, --ink,
+   * --ink-2, --rule, --muted, --lime, --warn, --err, --mono, --serif from the
+   * shared tokens. */
   --bubble-user-bg: #0a0a0a;
   --bubble-user-fg: #f4f1e8;
   --bubble-asst-bg: #ffffff;
@@ -50,7 +48,7 @@ body {
 }
 .topbar__hint {
   margin-left: auto;
-  color: var(--dim);
+  color: var(--muted);
   font-size: 12px;
   text-transform: lowercase;
 }
@@ -98,7 +96,7 @@ body {
 }
 .list__empty {
   padding: 14px;
-  color: var(--dim);
+  color: var(--muted);
   text-align: center;
   border: 2px dashed var(--rule);
 }
@@ -124,7 +122,7 @@ body {
 }
 .list__main.is-loading { opacity: 0.5; }
 .list__title { font-weight: 700; }
-.list__sub { color: var(--dim); font-size: 12px; word-break: break-all; }
+.list__sub { color: var(--muted); font-size: 12px; word-break: break-all; }
 .list__meta { font-size: 11px; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.05em; }
 .list__x {
   appearance: none;
@@ -163,11 +161,36 @@ body {
   cursor: pointer;
 }
 .btn--primary { background: var(--ink); color: var(--bone); }
-.btn--primary:disabled { background: var(--dim); cursor: not-allowed; }
+.btn--primary:disabled { background: var(--muted); cursor: not-allowed; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.hint { color: var(--dim); font-size: 12px; margin: 0; min-height: 1em; }
-.hint--err { color: var(--warn); }
+.hint { color: var(--muted); font-size: 12px; margin: 0; min-height: 1em; }
+.hint--err { color: var(--err); }
+
+.input--select {
+  background: #fff;
+  appearance: none;
+  -webkit-appearance: none;
+  flex: 1 1 100%;
+}
+
+.agent-badge {
+  display: inline-block;
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 2px 5px;
+  margin-right: 6px;
+  border: 1px solid var(--ink);
+  background: var(--bone);
+  color: var(--ink);
+  vertical-align: 1px;
+}
+[data-agent="copilot"] .agent-badge {
+  background: var(--ink);
+  color: var(--bone);
+}
 
 /* ───────── chat view ───────── */
 .chat {
@@ -211,7 +234,7 @@ body {
   align-self: center;
   max-width: 90%;
   font-size: 12px;
-  color: var(--dim);
+  color: var(--muted);
   background: transparent;
   border-style: dashed;
 }
@@ -228,7 +251,7 @@ body {
   font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
   background: var(--bone);
   padding: 1px 4px;
-  border: 1px solid #d4ceba;
+  border: 1px solid color-mix(in srgb, var(--bone) 70%, var(--ink) 20%);
 }
 .bubble__body pre code { background: transparent; border: 0; padding: 0; }
 .bubble__body a { color: var(--ink); text-decoration: underline; }
@@ -254,7 +277,12 @@ body {
   line-height: 1.4;
 }
 .composer__input:focus { outline: 3px solid var(--lime); outline-offset: -2px; }
-.composer__input:disabled { background: #ecead8; color: var(--dim); }
+.composer__input:disabled {
+  /* slight tint of the bone background so the disabled state reads at a glance
+   * without introducing a new ad-hoc colour. */
+  background: color-mix(in srgb, var(--bone) 85%, var(--ink) 8%);
+  color: var(--muted);
+}
 .btn--send {
   background: var(--lime);
   color: var(--ink);

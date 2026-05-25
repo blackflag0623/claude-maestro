@@ -1,7 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { StringDecoder } from 'node:string_decoder';
 import type { ChatMessage } from '../shared/protocol.js';
+import { debug } from './debug.js';
 
 /** Convert an absolute cwd to the slug Claude uses for its project directory.
  *  Observed rule (Claude Code 2.1.x on Windows):
@@ -110,6 +112,11 @@ export class TranscriptReader {
   private offset = 0;
   private partial = ''; // incomplete trailing line carried across reads
   private path: string | null = null;
+  // StringDecoder preserves incomplete multi-byte UTF-8 sequences across
+  // reads — a chunk boundary mid-codepoint would otherwise become a
+  // replacement char and corrupt the JSONL stream forever (since `offset`
+  // already advanced past those bytes).
+  private decoder = new StringDecoder('utf8');
 
   constructor(
     private readonly sessionId: string,
@@ -129,6 +136,7 @@ export class TranscriptReader {
     this.path = p;
     this.offset = Buffer.byteLength(buf, 'utf8');
     this.partial = '';
+    this.decoder = new StringDecoder('utf8');
     return parseJsonl(buf);
   }
 
@@ -137,24 +145,25 @@ export class TranscriptReader {
   readIncremental(): ChatMessage[] {
     const p = this.locate();
     if (!p) {
-      console.log(`[transcript] ${this.sessionId.slice(0, 8)} no transcript file found yet`);
+      debug(`[transcript] ${this.sessionId.slice(0, 8)} no transcript file found yet`);
       return [];
     }
     let st: fs.Stats;
     try {
       st = fs.statSync(p);
     } catch (err) {
-      console.log(`[transcript] ${this.sessionId.slice(0, 8)} stat failed: ${(err as Error).message}`);
+      debug(`[transcript] ${this.sessionId.slice(0, 8)} stat failed: ${(err as Error).message}`);
       return [];
     }
     if (st.size === this.offset) {
-      console.log(`[transcript] ${this.sessionId.slice(0, 8)} no growth (size=${st.size})`);
+      debug(`[transcript] ${this.sessionId.slice(0, 8)} no growth (size=${st.size})`);
       return [];
     }
     if (st.size < this.offset) {
-      console.log(`[transcript] ${this.sessionId.slice(0, 8)} shrank ${this.offset}→${st.size}, restarting`);
+      debug(`[transcript] ${this.sessionId.slice(0, 8)} shrank ${this.offset}→${st.size}, restarting`);
       this.offset = 0;
       this.partial = '';
+      this.decoder = new StringDecoder('utf8');
     }
     const length = st.size - this.offset;
     let chunk: string;
@@ -165,13 +174,13 @@ export class TranscriptReader {
       try {
         const buf = Buffer.allocUnsafe(length);
         const read = fs.readSync(fd, buf, 0, length, this.offset);
-        chunk = this.partial + buf.slice(0, read).toString('utf8');
+        chunk = this.partial + this.decoder.write(buf.slice(0, read));
         this.offset += read;
       } finally {
         fs.closeSync(fd);
       }
     } catch (err) {
-      console.log(`[transcript] ${this.sessionId.slice(0, 8)} pread failed (${(err as Error).message}), falling back to readFile`);
+      debug(`[transcript] ${this.sessionId.slice(0, 8)} pread failed (${(err as Error).message}), falling back to readFile`);
       try {
         const whole = fs.readFileSync(p, 'utf8');
         const totalBytes = Buffer.byteLength(whole, 'utf8');
@@ -179,14 +188,15 @@ export class TranscriptReader {
           this.offset = 0;
           this.partial = '';
         }
-        // Best-effort byte slice; the file is UTF-8 and JSONL lines are
-        // self-contained so a wrong split would still resolve at the next
-        // newline boundary via this.partial.
+        // readFileSync handles UTF-8 framing for the whole file, so resync the
+        // decoder rather than feeding it sliced bytes — sliced bytes could
+        // start mid-codepoint and corrupt the next pread cycle.
+        this.decoder = new StringDecoder('utf8');
         const tail = Buffer.from(whole, 'utf8').slice(this.offset).toString('utf8');
         chunk = this.partial + tail;
         this.offset = totalBytes;
       } catch (err2) {
-        console.log(`[transcript] ${this.sessionId.slice(0, 8)} fallback also failed: ${(err2 as Error).message}`);
+        debug(`[transcript] ${this.sessionId.slice(0, 8)} fallback also failed: ${(err2 as Error).message}`);
         return [];
       }
     }
@@ -197,7 +207,7 @@ export class TranscriptReader {
     }
     this.partial = chunk.slice(lastNl + 1);
     const msgs = parseJsonl(chunk.slice(0, lastNl));
-    console.log(`[transcript] ${this.sessionId.slice(0, 8)} read ${length} bytes → ${msgs.length} message(s) (offset now ${this.offset})`);
+    debug(`[transcript] ${this.sessionId.slice(0, 8)} read ${length} bytes → ${msgs.length} message(s) (offset now ${this.offset})`);
     return msgs;
   }
 

@@ -1,19 +1,29 @@
 import type {
+  AgentType,
   ChatMessage,
   ClientMessage,
   ServerMessage,
   SessionInfo,
 } from '../shared/protocol';
-import { MaestroApi } from '../client/api';
+import { MaestroApi } from '../client-shared/api';
+import { debug } from '../client-shared/debug';
 import type { MobileServerEntry } from './mobile-state';
 
-// `marked` is loaded from CDN in index.html as a UMD global. Pulling it via
-// `import 'marked'` triggers Vite's optimize-deps pipeline, which has been
-// racing against itself on this setup and serving stale 504s. Using the CDN
-// global removes Vite from that path entirely.
+// `marked` and `DOMPurify` are loaded as UMD globals from CDN in index.html.
+// Pulling them via `import` triggers Vite's optimize-deps pipeline, which has
+// been racing against itself on this setup and serving stale 504s. Using the
+// CDN globals removes Vite from that path entirely.
+//
+// SECURITY: marked's output is HTML that may contain script tags or `on*`
+// attributes if Claude's transcript ever contained crafted text (e.g. a
+// prompt-injection from a file Claude was asked to summarize). Always pipe
+// marked output through DOMPurify before assigning to innerHTML.
 declare const marked: {
   parse: (s: string) => string;
   setOptions: (o: { gfm?: boolean; breaks?: boolean }) => void;
+};
+declare const DOMPurify: {
+  sanitize: (dirty: string, cfg?: Record<string, unknown>) => string;
 };
 
 if (typeof marked !== 'undefined') {
@@ -21,17 +31,25 @@ if (typeof marked !== 'undefined') {
 } else {
   console.warn('[chat] marked global missing — bubbles will fall back to plain text');
 }
+if (typeof DOMPurify === 'undefined') {
+  console.warn('[chat] DOMPurify global missing — markdown will be rendered as escaped plain text for safety');
+}
 
 function renderMarkdown(text: string): string {
-  if (typeof marked === 'undefined') {
-    // Plain-text fallback: escape and preserve newlines.
-    return text
+  // Always-safe fallback: HTML-escape and preserve newlines. Used when either
+  // CDN script failed to load.
+  const plain = () =>
+    text
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/\n/g, '<br>');
+
+  if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
+    return plain();
   }
-  return marked.parse(text);
+  const dirty = marked.parse(text);
+  return DOMPurify.sanitize(dirty);
 }
 
 interface ChatBubble {
@@ -91,6 +109,10 @@ export function renderChat(
   let ws: WebSocket | null = null;
   let inputLocked = true;
   let attached = false;
+  let agentType: AgentType = 'claude';
+
+  const agentDisplay = (a: AgentType) => (a === 'copilot' ? 'Copilot' : 'Claude');
+  const workingMsg = () => `${agentDisplay(agentType)} is working…`;
 
   function setStatus(text: string) {
     statusEl.textContent = text;
@@ -120,7 +142,7 @@ export function renderChat(
     }
     li.appendChild(body);
     bubblesEl.appendChild(li);
-    console.log(`[chat] bubble added (role=${b.role}, len=${b.text.length}); bubblesEl now has ${bubblesEl.children.length} children, scrollHeight=${bubblesEl.scrollHeight}, clientHeight=${bubblesEl.clientHeight}`);
+    debug(`[chat] bubble added (role=${b.role}, len=${b.text.length}); bubblesEl now has ${bubblesEl.children.length} children, scrollHeight=${bubblesEl.scrollHeight}, clientHeight=${bubblesEl.clientHeight}`);
     // Keep latest in view after layout.
     requestAnimationFrame(() => {
       bubblesEl.scrollTop = bubblesEl.scrollHeight;
@@ -139,15 +161,40 @@ export function renderChat(
   /** Live chatMessage frames may echo a user_text we just sent (transcript
    *  flush picks up both user and assistant entries from the same Stop event).
    *  We render the user bubble locally on send for instant feedback, so drop
-   *  live user_text frames that match a recent local send to avoid dupes. */
-  const recentSent: string[] = [];
+   *  live user_text frames that match a recent local send to avoid dupes.
+   *
+   *  Matching is whitespace-normalized: Claude's transcript writer occasionally
+   *  trims trailing newlines or normalizes line endings, which would make a
+   *  strict-equality compare miss the echo.
+   *
+   *  Each entry expires after RECENT_SENT_TTL_MS. Without expiry, a user who
+   *  sends the same word twice (e.g. "yes") would have the second send's echo
+   *  swallowed by the first send's leftover. */
+  const RECENT_SENT_TTL_MS = 30_000;
+  const RECENT_SENT_MAX = 32;
+  interface RecentSend { norm: string; ts: number }
+  const recentSent: RecentSend[] = [];
+  const normalizeForEcho = (s: string) => s.replace(/\s+$/g, '').replace(/\r\n/g, '\n');
+  function trackSent(text: string) {
+    recentSent.push({ norm: normalizeForEcho(text), ts: Date.now() });
+    if (recentSent.length > RECENT_SENT_MAX) recentSent.shift();
+  }
+  function consumeEcho(text: string): boolean {
+    const cutoff = Date.now() - RECENT_SENT_TTL_MS;
+    // Drop expired entries from the head.
+    while (recentSent.length > 0 && recentSent[0]!.ts < cutoff) recentSent.shift();
+    const norm = normalizeForEcho(text);
+    const idx = recentSent.findIndex((r) => r.norm === norm);
+    if (idx < 0) return false;
+    recentSent.splice(idx, 1);
+    return true;
+  }
+
   function onLiveChatMessage(m: ChatMessage) {
-    console.log('[chat] live msg', m.type, JSON.stringify(m).slice(0, 200));
+    debug('[chat] live msg', m.type, JSON.stringify(m).slice(0, 200));
     if (m.type === 'user_text') {
-      const idx = recentSent.indexOf(m.text);
-      if (idx >= 0) {
-        console.log('[chat] suppressed echo of locally-sent text');
-        recentSent.splice(idx, 1);
+      if (consumeEcho(m.text)) {
+        debug('[chat] suppressed echo of locally-sent text');
         return;
       }
       addBubble({ role: 'user', text: m.text, ts: m.ts });
@@ -160,10 +207,10 @@ export function renderChat(
     setStatus('connecting…');
     lockInput('connecting…');
     const url = api.wsUrl(sessionId);
-    console.log('[chat] connecting to', url);
+    debug('[chat] connecting to', url);
     ws = new WebSocket(url);
     ws.addEventListener('open', () => {
-      console.log('[chat] ws open, sending attachChat');
+      debug('[chat] ws open, sending attachChat');
       setStatus('attaching…');
       const attachMsg: ClientMessage = {
         type: 'attachChat',
@@ -180,11 +227,11 @@ export function renderChat(
         console.warn('[chat] bad frame', ev.data);
         return;
       }
-      console.log('[chat] <-', msg.type, msg);
+      debug('[chat] <-', msg.type, msg);
       onServerMessage(msg);
     });
     ws.addEventListener('close', (ev) => {
-      console.log('[chat] ws close', ev.code, ev.reason);
+      debug('[chat] ws close', ev.code, ev.reason);
       if (!attached) {
         setStatus(`closed before attach (code ${ev.code})`);
         lockInput('connection closed — reload to retry');
@@ -204,6 +251,8 @@ export function renderChat(
       attached = false;
       if (msg.code === 'chatLocked') {
         renderLocked();
+      } else if (msg.code === 'chatNotSupported') {
+        renderUnsupported(msg.message);
       } else {
         setStatus('error');
         addSystem(`error: ${msg.message}`);
@@ -212,11 +261,13 @@ export function renderChat(
     }
     if (msg.type === 'chatAttached') {
       attached = true;
+      agentType = msg.session.agentType ?? 'claude';
       titleEl.textContent = msg.session.title;
       setStatus(sessionStatusLabel(msg.session));
       for (const m of msg.history) applyAssistantMessage(m);
       // Treat any prior history as a signal that input is ok. If there is no
-      // history, also unlock — Claude is initializing but we accept queued input.
+      // history, also unlock — the agent is initializing but we accept queued
+      // input.
       unlockInput();
       return;
     }
@@ -228,7 +279,7 @@ export function renderChat(
     if (msg.type === 'activity') {
       setStatus(msg.activity);
       if (msg.activity === 'working') {
-        lockInput('Claude is working…');
+        lockInput(workingMsg());
       } else {
         // Idle, waiting, or unknown — let the user type.
         unlockInput();
@@ -263,6 +314,26 @@ export function renderChat(
     });
   }
 
+  function renderUnsupported(msg: string) {
+    try { ws?.close(); } catch {}
+    root.innerHTML = `
+      <header class="topbar">
+        <button class="topbar__back" id="back" aria-label="back">‹</button>
+        <span class="topbar__title">chat unavailable</span>
+      </header>
+      <main class="screen">
+        <p class="hint hint--err">
+          this agent does not expose a structured chat transcript yet, so the
+          mobile chat view cannot render its conversation.<br/><br/>
+          open this session from the desktop terminal portal to interact with
+          it directly.
+        </p>
+        <p class="hint">server said: ${msg.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</p>
+      </main>
+    `;
+    root.querySelector<HTMLButtonElement>('#back')!.addEventListener('click', () => cb.onBack());
+  }
+
   function addSystem(text: string) {
     const li = document.createElement('li');
     li.className = 'bubble bubble--system';
@@ -280,9 +351,16 @@ export function renderChat(
     if (!text.trim()) return;
     addBubble({ role: 'user', text, ts: Date.now() });
     // Remember the exact text so the transcript flush echo doesn't duplicate it.
-    recentSent.push(text);
-    if (recentSent.length > 16) recentSent.shift();
-    const msg: ClientMessage = { type: 'input', data: text + '\r' };
+    trackSent(text);
+    // Multi-line input must be wrapped in bracketed-paste markers (CSI ?2004h)
+    // so claude doesn't treat each embedded LF as a turn-submit. Single-line
+    // input keeps the plain `text + \r` path because brackets would leak as
+    // literal characters if claude has temporarily disabled paste mode (rare
+    // but possible during certain tool runs).
+    const data = text.includes('\n')
+      ? `\x1b[200~${text}\x1b[201~\r`
+      : `${text}\r`;
+    const msg: ClientMessage = { type: 'input', data };
     try {
       ws?.send(JSON.stringify(msg));
     } catch {
@@ -291,9 +369,9 @@ export function renderChat(
     }
     inputEl.value = '';
     autosize();
-    // Lock until Claude responds. Activity 'working' will keep it locked;
+    // Lock until the agent responds. Activity 'working' will keep it locked;
     // a chatMessage will unlock.
-    lockInput('Claude is working…');
+    lockInput(workingMsg());
   }
 
   function autosize() {

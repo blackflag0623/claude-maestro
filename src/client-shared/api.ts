@@ -5,6 +5,14 @@ import type {
   SessionInfo,
 } from '../shared/protocol';
 
+/**
+ * REST + WebSocket client for a single maestro backend.
+ *
+ * One `MaestroApi` instance is bound to one `baseUrl` (a maestro server's
+ * origin, or '' / '/' for same-origin). Shared between the desktop and
+ * mobile clients — keep this module dependency-free of any UI concerns.
+ */
+
 async function failure(r: Response, fallback: string): Promise<never> {
   let detail = `${fallback} ${r.status}`;
   try {
@@ -12,6 +20,10 @@ async function failure(r: Response, fallback: string): Promise<never> {
     if (j?.error) detail = j.error;
   } catch {}
   throw new Error(detail);
+}
+
+export interface RequestOpts {
+  signal?: AbortSignal;
 }
 
 export class MaestroApi {
@@ -38,59 +50,66 @@ export class MaestroApi {
     return u.toString();
   }
 
-  async health(): Promise<{ ok: boolean; sessions: number }> {
-    const r = await fetch(this.url('/api/health'));
+  async health(opts: RequestOpts = {}): Promise<{ ok: boolean; sessions: number }> {
+    const r = await fetch(this.url('/api/health'), { signal: opts.signal });
     if (!r.ok) await failure(r, 'health');
     return r.json();
   }
 
-  async list(): Promise<SessionInfo[]> {
-    const r = await fetch(this.url('/api/sessions'));
+  async list(opts: RequestOpts = {}): Promise<SessionInfo[]> {
+    const r = await fetch(this.url('/api/sessions'), { signal: opts.signal });
     if (!r.ok) await failure(r, 'list');
     return (await r.json()).sessions as SessionInfo[];
   }
 
-  async create(body: CreateSessionBody = {}): Promise<SessionInfo> {
+  async create(body: CreateSessionBody = {}, opts: RequestOpts = {}): Promise<SessionInfo> {
     const r = await fetch(this.url('/api/sessions'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: opts.signal,
     });
     if (!r.ok) await failure(r, 'create');
     return (await r.json()).session as SessionInfo;
   }
 
-  async kill(id: string): Promise<void> {
+  async kill(id: string, opts: RequestOpts = {}): Promise<void> {
     const r = await fetch(this.url(`/api/sessions/${encodeURIComponent(id)}`), {
       method: 'DELETE',
+      signal: opts.signal,
     });
     if (!r.ok && r.status !== 404) await failure(r, 'kill');
   }
 
   async completePath(
     prefix: string,
-    init?: RequestInit,
+    opts: RequestOpts = {},
   ): Promise<{ base: string; entries: string[] }> {
-    const r = await fetch(this.url(`/api/fs/complete?prefix=${encodeURIComponent(prefix)}`), init);
+    const r = await fetch(
+      this.url(`/api/fs/complete?prefix=${encodeURIComponent(prefix)}`),
+      { signal: opts.signal },
+    );
     if (!r.ok) await failure(r, 'complete');
     return r.json();
   }
 
-  async fsList(sessionId: string, path = ''): Promise<FsListResponse> {
+  async fsList(sessionId: string, path = '', opts: RequestOpts = {}): Promise<FsListResponse> {
     const r = await fetch(
       this.url(
         `/api/fs/list?sessionId=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}`,
       ),
+      { signal: opts.signal },
     );
     if (!r.ok) await failure(r, 'fs list');
     return r.json();
   }
 
-  async fsRead(sessionId: string, path: string): Promise<FsReadResponse> {
+  async fsRead(sessionId: string, path: string, opts: RequestOpts = {}): Promise<FsReadResponse> {
     const r = await fetch(
       this.url(
         `/api/fs/read?sessionId=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}`,
       ),
+      { signal: opts.signal },
     );
     if (!r.ok) await failure(r, 'fs read');
     return r.json();

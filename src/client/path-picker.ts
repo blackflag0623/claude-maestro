@@ -1,4 +1,4 @@
-import type { MaestroApi } from './api';
+import type { MaestroApi } from '../client-shared/api';
 
 /**
  * Attaches an autocomplete dropdown to a text input. Each keystroke debounces

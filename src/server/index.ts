@@ -7,8 +7,10 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import * as pty from '@lydell/node-pty';
-import { TranscriptReader } from './transcript-reader.js';
+import { ScrollbackBuffer } from './scrollback.js';
+import { debug } from './debug.js';
 import type {
+  AgentType,
   ChatMessage,
   ClientMessage,
   ServerMessage,
@@ -16,6 +18,13 @@ import type {
   SessionActivity,
   CreateSessionBody,
 } from '../shared/protocol.js';
+import { AGENT_TYPES } from '../shared/protocol.js';
+import { getStrategy, type AgentReader, type SpawnTarget } from './agents/index.js';
+import { initAgentEnvironments } from './agents/all.js';
+
+function isAgentType(x: unknown): x is AgentType {
+  return typeof x === 'string' && (AGENT_TYPES as readonly string[]).includes(x);
+}
 
 const PORT = Number(process.env.PORT ?? 4050);
 const SCROLLBACK_BYTES = 256 * 1024;
@@ -25,12 +34,28 @@ const STORE_DIR =
 const STORE_FILE = path.join(STORE_DIR, 'sessions.json');
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Read package.json once at startup. We walk up from this file because the
+// server runs from `dist/server/` after build but from `src/server/` under
+// `tsx`; in either case the package.json is two directories up.
+const PKG_VERSION: string = (() => {
+  try {
+    const pkgPath = path.resolve(__dirname, '..', '..', 'package.json');
+    const raw = fs.readFileSync(pkgPath, 'utf8');
+    return (JSON.parse(raw) as { version?: string }).version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
+
 interface PersistedSession {
   id: string;
   title: string;
   cwd: string;
   createdAt: number;
   hasResumeData: boolean; // false until first run actually persists conversation
+  /** Which CLI agent backs this session. Defaults to `'claude'` on load for
+   *  records persisted before the agent abstraction was introduced. */
+  agentType: AgentType;
 }
 
 interface Session extends PersistedSession {
@@ -39,16 +64,16 @@ interface Session extends PersistedSession {
   rows: number;
   alive: boolean;
   exitCode: number | null;
-  scrollback: string;
+  scrollback: ScrollbackBuffer;
   subscribers: Set<WebSocket>;
   /** Subset of `subscribers` that attached via `attachChat`. They receive
-   *  `chatMessage` frames (parsed from Claude's JSONL transcript) instead of
-   *  raw `output`. */
+   *  `chatMessage` frames (parsed from the agent's on-disk transcript)
+   *  instead of raw `output`. */
   chatSubscribers: Set<WebSocket>;
-  /** Incremental reader of `~/.claude/projects/<slug>/<uuid>.jsonl`. Lazily
-   *  created on first chat attach; primed with whole file as history then
-   *  advanced on every Stop hook. */
-  transcriptReader: TranscriptReader | null;
+  /** Per-agent transcript reader. Lazily created when the PTY is spawned,
+   *  used both to derive activity (claude via hook poke / copilot via file
+   *  tailing) and to serve chat history on `attachChat`. */
+  reader: AgentReader | null;
   activity: SessionActivity;
 }
 
@@ -63,6 +88,7 @@ function persist() {
     cwd: s.cwd,
     createdAt: s.createdAt,
     hasResumeData: s.hasResumeData,
+    agentType: s.agentType,
   }));
   try {
     fs.mkdirSync(STORE_DIR, { recursive: true });
@@ -83,59 +109,45 @@ function loadPersisted() {
   }
   for (const p of raw) {
     if (!p?.id || !p?.cwd) continue;
+    // Backward compat: pre-abstraction records have no agentType. Unknown
+    // values get quarantined (we skip the entry rather than crash later).
+    const at = (p as Partial<PersistedSession>).agentType;
+    let agentType: AgentType;
+    if (at === undefined) {
+      agentType = 'claude';
+    } else if (isAgentType(at)) {
+      agentType = at;
+    } else {
+      console.warn(`[maestro] skipping session ${p.id} with unknown agentType: ${String(at)}`);
+      continue;
+    }
     sessions.set(p.id, {
       id: p.id,
       title: p.title ?? `node-${p.id.slice(0, 4)}`,
       cwd: p.cwd,
       createdAt: p.createdAt ?? Date.now(),
       hasResumeData: p.hasResumeData ?? false,
+      agentType,
       term: null,
       cols: 120,
       rows: 30,
       alive: false,
       exitCode: null,
-      scrollback: '',
+      scrollback: new ScrollbackBuffer(SCROLLBACK_BYTES),
       subscribers: new Set(),
       chatSubscribers: new Set(),
-      transcriptReader: null,
+      reader: null,
       activity: 'unknown',
     });
   }
-  console.log(`[maestro] restored ${sessions.size} dormant session(s) from ${STORE_FILE}`);
+  debug(`[maestro] restored ${sessions.size} dormant session(s) from ${STORE_FILE}`);
 }
 
 // ───────── helpers ─────────
 
-const CLAUDE_BIN_RAW = process.env.MAESTRO_CLAUDE_BIN ?? 'claude';
-const CLAUDE_BIN = resolveClaudeBin(CLAUDE_BIN_RAW);
-
-function resolveClaudeBin(name: string): string {
-  // If the user gave an absolute or relative path that exists as-is, use it.
-  if (name.includes(path.sep) || name.includes('/')) {
-    return name;
-  }
-  // Walk PATH, trying common Windows extensions first on win32.
-  const exts =
-    process.platform === 'win32'
-      ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.toLowerCase())
-      : [''];
-  const dirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
-  for (const d of dirs) {
-    for (const ext of exts) {
-      const candidate = path.join(d, name + ext);
-      try {
-        if (fs.statSync(candidate).isFile()) return candidate;
-      } catch {}
-    }
-  }
-  // Fall through: spawn will probably fail, but the user will see a clear error.
-  return name;
-}
-
 function toInfo(s: Session): SessionInfo {
   return {
     id: s.id,
-    shell: CLAUDE_BIN,
     cwd: s.cwd,
     cols: s.cols,
     rows: s.rows,
@@ -144,14 +156,12 @@ function toInfo(s: Session): SessionInfo {
     title: s.title,
     attached: s.term !== null,
     activity: s.activity,
+    agentType: s.agentType,
   };
 }
 
 function appendScrollback(s: Session, data: string) {
-  s.scrollback += data;
-  if (s.scrollback.length > SCROLLBACK_BYTES * 1.5) {
-    s.scrollback = s.scrollback.slice(-SCROLLBACK_BYTES);
-  }
+  s.scrollback.append(data);
 }
 
 function broadcast(s: Session, msg: ServerMessage) {
@@ -254,99 +264,29 @@ function setActivity(s: Session, a: SessionActivity) {
   broadcast(s, { type: 'activity', activity: a });
 }
 
-// ───────── hooks (per-session activity tracking) ─────────
+// ───────── PTY spawn (agent-agnostic) ─────────
 
-const HOOK_SCRIPT = path.join(STORE_DIR, 'hook.mjs');
-const HOOK_SETTINGS = path.join(STORE_DIR, 'hooks.json');
-const HOOK_URL = `http://127.0.0.1:${PORT}/api/hook`;
-const NODE_BIN = process.execPath;
+/** Grace period before disposing a reader after natural PTY exit. Gives the
+ *  agent a final chance to flush any tail-end transcript writes. */
+const READER_DISPOSE_GRACE_MS = 1500;
 
-const HOOK_ACTIVITY = {
-  UserPromptSubmit: 'working',
-  PreToolUse: 'working',
-  PostToolUse: 'working',
-  Notification: 'waiting',
-  Stop: 'idle',
-} as const satisfies Record<string, SessionActivity>;
+function spawnAgent(s: Session, mode: 'new' | 'resume') {
+  const strategy = getStrategy(s.agentType);
+  const target: SpawnTarget = { id: s.id, cwd: s.cwd, cols: s.cols, rows: s.rows };
 
-const quote = (s: string) => (/[\s"]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s);
-// Hook commands are JSON-decoded by claude then passed to a shell. On Windows
-// the shell is often bash (Git Bash), which eats backslashes in unquoted
-// `\n`/`\v`/etc. — turn paths into forward slashes so they survive both shells.
-const shellPath = (p: string) => (process.platform === 'win32' ? p.replace(/\\/g, '/') : p);
-
-function ensureHookFiles() {
-  try {
-    fs.mkdirSync(STORE_DIR, { recursive: true });
-    // Cross-platform hook: tiny Node script. Reads JSON from stdin, fires a
-    // POST to the maestro server, exits immediately. No shell dependency.
-    const script = `import http from 'node:http';
-const event = process.argv[2] ?? '';
-let body = '';
-process.stdin.on('data', (c) => { body += c; });
-process.stdin.on('end', () => {
-  const req = http.request(${JSON.stringify(HOOK_URL)}, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'content-length': Buffer.byteLength(body),
-      'x-maestro-event': event,
-    },
-    timeout: 2000,
-  });
-  req.on('error', () => process.exit(0));
-  req.on('response', () => process.exit(0));
-  req.on('timeout', () => { req.destroy(); process.exit(0); });
-  req.end(body);
-});
-process.stdin.on('error', () => process.exit(0));
-`;
-    fs.writeFileSync(HOOK_SCRIPT, script);
-    if (process.platform !== 'win32') fs.chmodSync(HOOK_SCRIPT, 0o755);
-    const command = `${quote(shellPath(NODE_BIN))} ${quote(shellPath(HOOK_SCRIPT))}`;
-    const settings = {
-      hooks: Object.fromEntries(
-        Object.keys(HOOK_ACTIVITY).map((event) => [
-          event,
-          [{ hooks: [{ type: 'command', command: `${command} ${event}` }] }],
-        ]),
-      ),
-    };
-    fs.writeFileSync(HOOK_SETTINGS, JSON.stringify(settings, null, 2));
-  } catch (err) {
-    console.error('[maestro] could not write hook files:', (err as Error).message);
-  }
-}
-
-// ───────── PTY spawn ─────────
-
-/** Spawn `claude` with --session-id (new) or --resume (existing). */
-function spawnClaude(s: Session, mode: 'new' | 'resume') {
-  const baseArgs =
-    mode === 'new'
-      ? ['--session-id', s.id]
-      : ['--resume', s.id];
-  const hookArgs = ['--settings', HOOK_SETTINGS];
-  const args = [...baseArgs, ...hookArgs];
-
-  let term: pty.IPty;
-  try {
-    term = pty.spawn(CLAUDE_BIN, args, {
-      name: 'xterm-256color',
-      cols: s.cols,
-      rows: s.rows,
-      cwd: s.cwd,
-      env: { ...process.env, MAESTRO_SESSION: s.id } as Record<string, string>,
-    });
-  } catch (err) {
-    const message = `failed to spawn ${CLAUDE_BIN}: ${(err as Error).message}`;
-    console.error(`[maestro] ${message}`);
-    throw new Error(message);
-  }
-
+  const term = strategy.spawn(target, mode);
   s.term = term;
   s.alive = true;
   s.exitCode = null;
+
+  // Reader is created once per spawn so it sees the same target snapshot the
+  // PTY was spawned with. Disposed on natural exit (with grace) or kill.
+  if (!s.reader) {
+    s.reader = strategy.createReader(target, {
+      onActivity: (a) => setActivity(s, a),
+      onChatMessage: (m) => broadcastChat(s, { type: 'chatMessage', message: m }),
+    });
+  }
 
   term.onData((data: string) => {
     appendScrollback(s, data);
@@ -364,12 +304,24 @@ function spawnClaude(s: Session, mode: 'new' | 'resume') {
     s.term = null;
     setActivity(s, 'unknown');
     broadcast(s, { type: 'exit', code: exitCode });
+    // Give the reader a brief window to catch a final transcript write
+    // (e.g. an `assistant.turn_end` event arriving just after the PTY exits)
+    // before tearing down its timers.
+    const reader = s.reader;
+    if (reader) {
+      s.reader = null;
+      setTimeout(() => {
+        try {
+          reader.dispose();
+        } catch {}
+      }, READER_DISPOSE_GRACE_MS);
+    }
   });
 }
 
 function ensureSpawned(s: Session) {
   if (s.term) return;
-  spawnClaude(s, s.hasResumeData ? 'resume' : 'new');
+  spawnAgent(s, s.hasResumeData ? 'resume' : 'new');
 }
 
 // ───────── lifecycle ─────────
@@ -380,26 +332,34 @@ function createSession(body: CreateSessionBody): Session {
   if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
     throw new Error(`cwd does not exist or is not a directory: ${cwd}`);
   }
+  let agentType: AgentType = 'claude';
+  if (body.agentType !== undefined) {
+    if (!isAgentType(body.agentType)) {
+      throw new Error(`unknown agentType: ${String(body.agentType)}`);
+    }
+    agentType = body.agentType;
+  }
   const s: Session = {
     id,
     title: body.title?.trim() || `node-${id.slice(0, 4)}`,
     cwd,
     createdAt: Date.now(),
     hasResumeData: false,
+    agentType,
     term: null,
     cols: body.cols ?? 120,
     rows: body.rows ?? 30,
     alive: false,
     exitCode: null,
-    scrollback: '',
+    scrollback: new ScrollbackBuffer(SCROLLBACK_BYTES),
     subscribers: new Set(),
     chatSubscribers: new Set(),
-    transcriptReader: null,
+    reader: null,
     activity: 'unknown',
   };
   sessions.set(id, s);
   try {
-    spawnClaude(s, 'new');
+    spawnAgent(s, 'new');
   } catch (err) {
     sessions.delete(id);
     throw err;
@@ -417,6 +377,12 @@ function killSession(id: string): boolean {
       s.term.kill();
     } catch {}
   }
+  if (s.reader) {
+    try {
+      s.reader.dispose();
+    } catch {}
+    s.reader = null;
+  }
   for (const ws of s.subscribers) {
     try {
       ws.close();
@@ -424,8 +390,10 @@ function killSession(id: string): boolean {
   }
   sessions.delete(id);
   persist();
-  // Note: leaves ~/.claude/projects/<slug>/<uuid>.jsonl on disk; user can
-  // still rehydrate via `claude --resume <uuid>` from a shell if desired.
+  // Note: leaves the agent's on-disk transcript intact (Claude's
+  // ~/.claude/projects/<slug>/<uuid>.jsonl or Copilot's
+  // ~/.copilot/session-state/<uuid>/events.jsonl) so the user can still
+  // rehydrate via the agent's own `--resume <uuid>` from a shell if desired.
   return true;
 }
 
@@ -446,8 +414,41 @@ app.use((req, res, next) => {
   next();
 });
 
+// Security headers for the static client pages. We can't lock `connect-src`
+// down because the desktop client connects to user-configured remote maestro
+// servers over HTTP(S)/WS(S); the rest of the policy still reduces blast
+// radius (no inline <script>, no framing, only known CDNs).
+//
+// `style-src 'unsafe-inline'` is required: both clients use inline
+// `style="--var:…"` attributes for dynamic CSS variables. The DOMPurify-
+// sanitized chat markdown also relies on `'unsafe-inline'` to render the
+// few inline styles marked allows by default. Tightening this would mean
+// either nonces (server-rendered, can't statically serve) or hashes for
+// every inline style — neither is worth the churn for this app's threat model.
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self' https://cdn.jsdelivr.net",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src 'self' https://fonts.gstatic.com",
+  "img-src 'self' data:",
+  "connect-src 'self' ws: wss: http: https:",
+  "frame-ancestors 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+].join('; ');
+
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) {
+    res.setHeader('Content-Security-Policy', CSP);
+    res.setHeader('X-Frame-Options', 'DENY');
+  }
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
+
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, name: 'claude-maestro', version: 2, sessions: sessions.size });
+  res.json({ ok: true, name: 'claude-maestro', version: PKG_VERSION, sessions: sessions.size });
 });
 
 app.get('/api/sessions', (_req, res) => {
@@ -473,53 +474,27 @@ app.delete('/api/sessions/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-// Hook callback: claude posts here from the wrapper script. The event name
-// arrives in `x-maestro-event`; the JSON body always contains `session_id`.
+// Hook callback: agent processes (currently only Claude) POST here from the
+// wrapper script. The event name arrives in `x-maestro-event`; the JSON body
+// always contains `session_id`. The strategy decides what each event means
+// for activity / chat — Copilot doesn't have hooks at all and its strategy
+// returns null.
 app.post('/api/hook', (req, res) => {
   const event = String(req.headers['x-maestro-event'] ?? '');
   const sid = (req.body?.session_id as string | undefined) ?? '';
-  console.log(`[hook] event=${event} session_id=${sid.slice(0, 8)}`);
-  const next = (HOOK_ACTIVITY as Record<string, SessionActivity>)[event];
+  debug(`[hook] event=${event} session_id=${sid.slice(0, 8)}`);
   const s = sid ? sessions.get(sid) : undefined;
   if (!s && sid) {
-    console.log(`[hook] no session in map for ${sid.slice(0, 8)} — known: [${[...sessions.keys()].map((k) => k.slice(0, 8)).join(',')}]`);
+    debug(`[hook] no session in map for ${sid.slice(0, 8)} — known: [${[...sessions.keys()].map((k) => k.slice(0, 8)).join(',')}]`);
   }
-  if (s && next) setActivity(s, next);
-  // Stop = end of one assistant turn. New transcript entries are now on disk;
-  // flush them to chat subscribers.
-  if (s && event === 'Stop') flushTranscript(s);
+  if (s) {
+    const strategy = getStrategy(s.agentType);
+    const outcome = strategy.handleHookEvent?.(event, req.body) ?? null;
+    if (outcome?.activity) setActivity(s, outcome.activity);
+    if (outcome?.flushChat) s.reader?.poke();
+  }
   res.status(204).end();
 });
-
-function flushTranscript(s: Session) {
-  console.log(`[flush] ${s.id.slice(0, 8)} chatSubscribers=${s.chatSubscribers.size}`);
-  if (s.chatSubscribers.size === 0) return;
-  if (!s.transcriptReader) s.transcriptReader = new TranscriptReader(s.id, s.cwd);
-
-  // Race: Claude's `Stop` hook fires before the assistant entries are fully
-  // appended to the JSONL file. Worse, one turn can write *multiple*
-  // assistant entries (tool-call followed by text reply, or split text).
-  // Strategy: poll across an exponential schedule and broadcast whatever
-  // appears each time. Offset tracking inside the reader prevents duplicate
-  // broadcasts. We never short-circuit on "saw assistant once" because a
-  // second entry can still be in flight.
-  const POLL_DELAYS_MS = [0, 120, 300, 600, 1200, 2400, 4000];
-  let attempt = 0;
-  const tick = () => {
-    const msgs = s.transcriptReader!.readIncremental();
-    if (msgs.length) {
-      console.log(`[flush] ${s.id.slice(0, 8)} attempt ${attempt} → ${msgs.length} msg(s): [${msgs.map((m) => m.type).join(',')}]`);
-    }
-    for (const m of msgs) {
-      broadcastChat(s, { type: 'chatMessage', message: m });
-    }
-    attempt++;
-    if (attempt < POLL_DELAYS_MS.length) {
-      setTimeout(tick, POLL_DELAYS_MS[attempt]!);
-    }
-  };
-  tick();
-}
 
 // ───────── filesystem completion ─────────
 
@@ -719,6 +694,37 @@ if (isDevSource) {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
+// WebSocket keepalive. Without this a half-open socket (mobile client backgrounded,
+// laptop slept, NAT idle-timeout, etc.) can hold an exclusive `attachChat`
+// subscription indefinitely, locking everyone else out with `chatLocked`.
+//
+// Protocol: every WS_PING_INTERVAL_MS we ping each socket; on the previous
+// tick we also check whether the pong from the round before that arrived.
+// If two consecutive intervals pass with no pong, terminate — which fires
+// `close`, which runs the cleanup in `attach()` and frees the session.
+const WS_PING_INTERVAL_MS = 25_000;
+interface KeepaliveSocket extends WebSocket { isAlive?: boolean }
+
+const keepaliveTimer = setInterval(() => {
+  for (const ws of wss.clients as Set<KeepaliveSocket>) {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    try {
+      ws.ping();
+    } catch {
+      // Socket already dying; next tick will terminate it.
+    }
+  }
+}, WS_PING_INTERVAL_MS);
+keepaliveTimer.unref?.();
+
+wss.on('close', () => {
+  clearInterval(keepaliveTimer);
+});
+
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '', 'http://localhost');
   if (url.pathname !== '/maestro-ws') {
@@ -732,6 +738,9 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
   wss.handleUpgrade(req, socket, head, (ws) => {
+    const ka = ws as KeepaliveSocket;
+    ka.isAlive = true;
+    ws.on('pong', () => { ka.isAlive = true; });
     attach(ws, sessionId);
   });
 });
@@ -764,7 +773,7 @@ function attach(ws: WebSocket, sessionId: string) {
       } catch (err) {
         const reply: ServerMessage = {
           type: 'error',
-          message: `failed to spawn claude: ${(err as Error).message}`,
+          message: `failed to spawn ${s.agentType}: ${(err as Error).message}`,
         };
         ws.send(JSON.stringify(reply));
         s.subscribers.delete(ws);
@@ -775,7 +784,7 @@ function attach(ws: WebSocket, sessionId: string) {
       const reply: ServerMessage = {
         type: 'attached',
         session: toInfo(s),
-        scrollback: s.scrollback,
+        scrollback: s.scrollback.read(),
       };
       ws.send(JSON.stringify(reply));
       if (!s.alive && s.exitCode !== null) {
@@ -806,7 +815,7 @@ function attach(ws: WebSocket, sessionId: string) {
       } catch (err) {
         const reply: ServerMessage = {
           type: 'error',
-          message: `failed to spawn claude: ${(err as Error).message}`,
+          message: `failed to spawn ${s.agentType}: ${(err as Error).message}`,
         };
         ws.send(JSON.stringify(reply));
         s.subscribers.delete(ws);
@@ -814,9 +823,23 @@ function attach(ws: WebSocket, sessionId: string) {
         ws.close();
         return;
       }
-      if (!s.transcriptReader) s.transcriptReader = new TranscriptReader(s.id, s.cwd);
+      // The spawn path lazily creates a reader for this session. If the
+      // strategy declined to (a future agent type without a transcript at
+      // all), tell the client up front so it can disable the chat UI.
+      if (!s.reader) {
+        const reply: ServerMessage = {
+          type: 'error',
+          code: 'chatNotSupported',
+          message: `agent ${s.agentType} does not support chat`,
+        };
+        ws.send(JSON.stringify(reply));
+        s.subscribers.delete(ws);
+        s.chatSubscribers.delete(ws);
+        ws.close();
+        return;
+      }
       attached = true;
-      const history: ChatMessage[] = s.transcriptReader.readAll();
+      const history: ChatMessage[] = s.reader.readAll();
       const reply: ServerMessage = {
         type: 'chatAttached',
         session: toInfo(s),
@@ -832,8 +855,8 @@ function attach(ws: WebSocket, sessionId: string) {
     if (!attached) return;
 
     if (msg.type === 'input') {
-      if (process.env.MAESTRO_CHAT_DEBUG && mode === 'chat') {
-        console.log(`[chat-debug] ${s.id.slice(0,8)} input from chat: ${JSON.stringify(msg.data.slice(0,80))}`);
+      if (mode === 'chat') {
+        debug(`[chat] ${s.id.slice(0, 8)} input: ${JSON.stringify(msg.data.slice(0, 80))}`);
       }
       writeToPty(s, msg.data);
     } else if (msg.type === 'resize') {
@@ -852,9 +875,10 @@ function attach(ws: WebSocket, sessionId: string) {
 }
 
 loadPersisted();
-ensureHookFiles();
+initAgentEnvironments();
 
 server.listen(PORT, () => {
-  console.log(`[maestro] http + ws on http://127.0.0.1:${PORT}`);
+  // Startup banner is intentionally unguarded — operators need to see it.
+  console.log(`[maestro] v${PKG_VERSION} http + ws on http://127.0.0.1:${PORT}`);
   console.log(`[maestro] store: ${STORE_FILE}`);
 });
