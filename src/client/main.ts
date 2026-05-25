@@ -164,18 +164,23 @@ function renderServer(srv: ServerEntry): HTMLLIElement {
   const known = state.knownNodes[srv.id] ?? [];
 
   li.innerHTML = `
-    <div class="server__row">
-      <span class="server__grip" title="drag to reorder" aria-hidden="true">⋮⋮</span>
+    <div class="server__row" tabindex="0">
       <span class="server__dot"></span>
       <span class="server__name">${escapeHtml(srv.name)}</span>
-      <button class="icon-btn" data-act="refresh" title="refresh" aria-label="refresh">↻</button>
-      <button class="icon-btn icon-btn--danger" data-act="remove" title="remove server" aria-label="remove">×</button>
     </div>
-    <div class="server__url">${escapeHtml(srv.baseUrl)}</div>
+    <div class="server__popup" role="group" aria-label="${escapeHtml(srv.name)} controls" hidden>
+      <div class="server__popup-name">${escapeHtml(srv.name)}</div>
+      <div class="server__popup-meta">
+        <span class="server__popup-label">URL</span>
+        <span class="server__popup-url" title="${escapeHtml(srv.baseUrl)}">${escapeHtml(srv.baseUrl)}</span>
+      </div>
+      <div class="server__popup-actions">
+        <button class="popup-btn popup-btn--primary" data-act="new-node">+ new node</button>
+        <button class="popup-btn" data-act="refresh" title="refresh" aria-label="refresh">↻ refresh</button>
+        <button class="popup-btn popup-btn--danger" data-act="remove" title="remove server" aria-label="remove">× remove</button>
+      </div>
+    </div>
     <ul class="node-list"></ul>
-    <div class="server__actions">
-      <button class="btn btn--block" data-act="new-node">+ node</button>
-    </div>
   `;
 
   const $nodes = li.querySelector('.node-list') as HTMLUListElement;
@@ -184,14 +189,110 @@ function renderServer(srv: ServerEntry): HTMLLIElement {
     $nodes.appendChild(renderNodeRow(ref, info));
   }
 
-  li.querySelector('[data-act="new-node"]')!.addEventListener('click', () => openNodeModal(srv.id));
+  li.querySelector('[data-act="new-node"]')!.addEventListener('click', () => { closeServerPopup(); openNodeModal(srv.id); });
   li.querySelector('[data-act="refresh"]')!.addEventListener('click', () => refreshServer(srv.id));
-  li.querySelector('[data-act="remove"]')!.addEventListener('click', () => removeServer(srv.id));
+  li.querySelector('[data-act="remove"]')!.addEventListener('click', () => { closeServerPopup(); removeServer(srv.id); });
 
+  wireServerPopup(li);
   attachDrag(li, { kind: 'server', serverId: srv.id });
 
   return li;
 }
+
+/* ── Hover-popup controller ───────────────────────────────────────────────
+   A server row at rest shows only [●] NAME. On hover/focus, a fixed-position
+   callout appears to the right of the row holding URL + actions. A small
+   grace timer lets the cursor travel between row and popup without flicker.
+   Closed automatically on scroll, resize, Escape, or pointer/focus leave. */
+let activePopupHost: HTMLElement | null = null;
+let popupCloseTimer: number | null = null;
+
+function cancelPopupClose(): void {
+  if (popupCloseTimer !== null) {
+    window.clearTimeout(popupCloseTimer);
+    popupCloseTimer = null;
+  }
+}
+
+function closeServerPopup(): void {
+  cancelPopupClose();
+  if (!activePopupHost) return;
+  const popup = activePopupHost.querySelector<HTMLElement>('.server__popup');
+  if (popup) {
+    popup.hidden = true;
+    popup.classList.remove('is-open');
+  }
+  activePopupHost.classList.remove('is-popup-open');
+  activePopupHost = null;
+}
+
+function scheduleClose(delay = 180): void {
+  cancelPopupClose();
+  popupCloseTimer = window.setTimeout(() => {
+    popupCloseTimer = null;
+    closeServerPopup();
+  }, delay);
+}
+
+function openServerPopup(li: HTMLElement): void {
+  cancelPopupClose();
+  if (activePopupHost === li) {
+    positionServerPopup(li);
+    return;
+  }
+  if (activePopupHost && activePopupHost !== li) closeServerPopup();
+  const popup = li.querySelector<HTMLElement>('.server__popup');
+  if (!popup) return;
+  popup.hidden = false;
+  popup.classList.add('is-open');
+  li.classList.add('is-popup-open');
+  activePopupHost = li;
+  positionServerPopup(li);
+}
+
+function positionServerPopup(li: HTMLElement): void {
+  const popup = li.querySelector<HTMLElement>('.server__popup');
+  const row = li.querySelector<HTMLElement>('.server__row');
+  if (!popup || !row) return;
+  const rect = row.getBoundingClientRect();
+  const popupW = popup.offsetWidth || 260;
+  const popupH = popup.offsetHeight || 120;
+  const gap = 8;
+  // Prefer right of the row; fall back to left if it would overflow viewport.
+  let left = rect.right + gap;
+  if (left + popupW + 8 > window.innerWidth) left = Math.max(8, rect.left - popupW - gap);
+  let top = rect.top;
+  if (top + popupH + 8 > window.innerHeight) top = Math.max(8, window.innerHeight - popupH - 8);
+  popup.style.left = `${Math.round(left)}px`;
+  popup.style.top = `${Math.round(top)}px`;
+}
+
+function wireServerPopup(li: HTMLElement): void {
+  const row = li.querySelector<HTMLElement>('.server__row');
+  const popup = li.querySelector<HTMLElement>('.server__popup');
+  if (!row || !popup) return;
+  row.addEventListener('mouseenter', () => openServerPopup(li));
+  row.addEventListener('mouseleave', () => scheduleClose());
+  row.addEventListener('focusin', () => openServerPopup(li));
+  row.addEventListener('focusout', (e) => {
+    const next = (e as FocusEvent).relatedTarget as Node | null;
+    if (next && (li.contains(next) || popup.contains(next))) return;
+    scheduleClose();
+  });
+  popup.addEventListener('mouseenter', () => cancelPopupClose());
+  popup.addEventListener('mouseleave', () => scheduleClose());
+  popup.addEventListener('focusout', (e) => {
+    const next = (e as FocusEvent).relatedTarget as Node | null;
+    if (next && (li.contains(next) || popup.contains(next))) return;
+    scheduleClose();
+  });
+}
+
+// Global listeners: hide popup on scroll/resize/Escape so it can't drift away
+// from its anchor row.
+window.addEventListener('scroll', () => closeServerPopup(), true);
+window.addEventListener('resize', () => closeServerPopup());
+window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeServerPopup(); });
 
 function renderNodeRow(ref: NodeRef, info?: SessionInfo): HTMLLIElement {
   const li = document.createElement('li');
