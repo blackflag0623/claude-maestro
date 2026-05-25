@@ -90,7 +90,7 @@ Strategies are registered as side-effects of importing `agents/all.ts`, which al
 | --- | --- | --- | --- |
 | `MAESTRO_CLAUDE_BIN` | `claude` | no | Path to the Claude binary (supports spaces). |
 | `MAESTRO_COPILOT_BIN` | `copilot` | no | Path to the Copilot binary (supports spaces). |
-| `MAESTRO_COPILOT_PREFIX_ARGS` | _(unset)_ | yes | Optional args inserted between the binary and the session flag. Use this for the Microsoft `agency` launcher: set `MAESTRO_COPILOT_BIN=agency` + `MAESTRO_COPILOT_PREFIX_ARGS=copilot` to get `agency copilot --session-id <uuid>`. |
+| `MAESTRO_COPILOT_PREFIX_ARGS` | _(unset)_ | yes | Optional args inserted between the binary and the session flag. Most users leave this unset. **Do not** use this with Microsoft's `agency` launcher — `agency` injects its own `--resume` and conflicts with maestro's `--session-id`; see KNOWN_ISSUES.md. |
 | `MAESTRO_STORE_DIR` | `~/.claude-maestro` | no | Override the registry directory. |
 
 **Copilot events.jsonl mapping** (`agents/copilot.ts`):

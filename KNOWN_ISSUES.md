@@ -46,11 +46,11 @@ _(none recorded yet)_
 
 ## Agent integrations
 
-### Copilot CLI launched via the `agency` wrapper
+### Copilot CLI launched via the Microsoft `agency` wrapper — **not supported**
 
-- **Symptom:** Setting `MAESTRO_COPILOT_BIN=agency` alone fails — `agency` is a launcher and needs the `copilot` subcommand before any other flag.
-- **Root cause:** The Copilot strategy invokes the configured binary with `[--session-id|--resume, <uuid>]` directly. To use a wrapper that expects a subcommand, you must prefix that subcommand as a separate token.
-- **Workaround:** Use the two-variable form: `MAESTRO_COPILOT_BIN=agency` and `MAESTRO_COPILOT_PREFIX_ARGS=copilot`. `MAESTRO_COPILOT_BIN` is *not* whitespace-split (paths with spaces are honored); `MAESTRO_COPILOT_PREFIX_ARGS` *is* whitespace-split and inserted between the binary and the session flag.
+- **Symptom:** Spawning a Copilot node via `MAESTRO_COPILOT_BIN=agency` + `MAESTRO_COPILOT_PREFIX_ARGS=copilot` fails with `Error: option '--session-id <id>' cannot be used with option '--resume[=value]'` (or, with the older `--session-id <uuid>` two-token form, the more confusing `Error: No session, task, or name matched '<uuid>'`).
+- **Root cause:** `agency` synthesizes its **own** session UUID and unconditionally injects `--resume <agency-uuid>` into the underlying `copilot.exe` invocation. There is no agency flag to suppress this. Maestro then appends `--session-id=<our-uuid>`, and Copilot rejects the conflict. Verified by inspecting the live `copilot.exe` command line via `Get-CimInstance Win32_Process` while `agency copilot --acp` was running — agency had already added `--resume f2a70fe3-…` before our args.
+- **Workaround:** **Bypass `agency` entirely.** On Microsoft devboxes the underlying Copilot CLI is on `PATH` at `C:\Users\<you>\AppData\Local\Microsoft\WinGet\Links\copilot.exe`, so the defaults (`MAESTRO_COPILOT_BIN=copilot`, no `MAESTRO_COPILOT_PREFIX_ARGS`) just work — clear those env vars before starting maestro. If `copilot` is not on `PATH` for the maestro process, point `MAESTRO_COPILOT_BIN` directly at the full `copilot.exe` path (still no prefix args). Agency's own job (session lifecycle, MCP wiring) overlaps with what maestro itself does, so going through it is not just unsupported but undesirable.
 
 ### Copilot CLI mobile chat: tool-only turns appear silent
 

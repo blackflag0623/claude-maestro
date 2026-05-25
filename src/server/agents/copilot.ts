@@ -18,10 +18,13 @@
 //                                splitting, so Windows paths like
 //                                `C:\Program Files\copilot.exe` work.
 //   MAESTRO_COPILOT_PREFIX_ARGS  optional whitespace-split prefix args
-//                                inserted before the session flag, for users
-//                                of launchers like Microsoft's Agency:
-//                                  MAESTRO_COPILOT_BIN=agency
-//                                  MAESTRO_COPILOT_PREFIX_ARGS=copilot
+//                                inserted before the session flag. Most users
+//                                leave this unset. Note: Microsoft's `agency`
+//                                wrapper is NOT supported here — it injects
+//                                its own `--resume <agency-uuid>` which
+//                                conflicts with maestro's `--session-id`.
+//                                Point MAESTRO_COPILOT_BIN at copilot.exe
+//                                directly instead.
 
 import fs from 'node:fs';
 import os from 'node:os';
