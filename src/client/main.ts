@@ -554,9 +554,17 @@ function renderTopbar() {
     return;
   }
   const srv = state.servers.find((s) => s.id === active.serverId);
+  // Identity block reads as one cohesive phrase:
+  //   [● SERVER]  →  node-title
+  // The dot is the same lime indicator used in the sidebar, so identity
+  // continuity across surfaces is preserved. The arrow is an italic serif
+  // glyph — same brand voice as the empty-state hero.
   $crumbs.innerHTML = `
-    <span class="crumb">${escapeHtml(srv?.name ?? '?')}</span>
-    <span class="crumb crumb--sep">/</span>
+    <span class="crumb crumb--server">
+      <span class="crumb__dot" aria-hidden="true"></span>
+      <span class="crumb__name">${escapeHtml(srv?.name ?? '?')}</span>
+    </span>
+    <span class="crumb crumb--sep" aria-hidden="true">→</span>
     <span class="crumb crumb--active">${escapeHtml(active.title)}</span>
   `;
   setStatus(nodes.get(nodeKey(active.serverId, active.sessionId))?.status ?? 'connecting');

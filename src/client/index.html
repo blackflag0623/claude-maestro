@@ -69,10 +69,14 @@
           >
             <span class="sidebar-toggle__icon" aria-hidden="true">‹</span>
           </button>
-          <div class="topbar__crumbs" id="crumbs">
+          <div class="topbar__id" id="crumbs">
             <span class="crumb crumb--muted">no node selected</span>
           </div>
-          <div class="topbar__center">
+          <span class="status" id="status" data-state="idle">
+            <span class="status__pulse" aria-hidden="true"></span>
+            <span class="status__label">idle</span>
+          </span>
+          <div class="topbar__tools">
             <div class="layout-switch" id="layout-switch" role="group" aria-label="screen layout">
               <button type="button" data-mode="single" title="single pane" aria-label="1 pane">
                 <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
@@ -120,12 +124,6 @@
                 disabled
               >↓&nbsp;html</button>
             </div>
-          </div>
-          <div class="topbar__status">
-            <span class="status" id="status" data-state="idle">
-              <span class="status__pulse" aria-hidden="true"></span>
-              <span class="status__label">idle</span>
-            </span>
           </div>
         </header>
 

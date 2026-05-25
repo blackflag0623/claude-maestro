@@ -506,21 +506,43 @@ button { font: inherit; color: inherit; }
 .topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 6px 14px;
+  padding: 8px 14px;
   border-bottom: 1.5px solid var(--ink);
   background: var(--bone);
   background-image: var(--grain);
   background-blend-mode: multiply;
-  min-height: 36px;
+  min-height: 44px;
+  gap: 12px;
+}
+
+/* Identity block — server dot + name, arrow, node title.
+   Reads left-to-right as one phrase and takes all the slack space so the
+   tools group ends up flush right without needing justify-content. */
+.topbar__id {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Right-side tools — layout switch + node actions, with a subtle ink hairline
+   between the two groups so they read as related-but-distinct. */
+.topbar__tools {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
   gap: 10px;
 }
 
 /* ───── sidebar toggle ───── */
 .sidebar-toggle {
   flex: 0 0 auto;
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -544,38 +566,75 @@ button { font: inherit; color: inherit; }
 }
 .app[data-sidebar="collapsed"] .sidebar-toggle__icon { transform: rotate(180deg); }
 
+/* Crumbs — identity tokens inside .topbar__id. */
 .crumb {
+  display: inline-flex;
+  align-items: baseline;
   font-size: 10.5px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
+  color: var(--ink);
 }
 .crumb--muted { color: var(--muted); }
+
+.crumb--server {
+  align-items: center;
+  gap: 7px;
+  padding: 3px 9px 3px 8px;
+  background: var(--bone-2);
+  border: 1.5px solid var(--ink);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+}
+.crumb__dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  background: var(--lime);
+  box-shadow: 0 0 6px rgba(198, 255, 61, 0.7);
+}
+.crumb__name { line-height: 1; }
+
 .crumb--sep {
   color: var(--muted);
-  margin: 0 6px;
   font-family: var(--serif);
   font-style: italic;
-  font-size: 13px;
+  font-size: 18px;
+  letter-spacing: 0;
+  line-height: 1;
+  align-self: center;
 }
 .crumb--active {
   font-weight: 700;
   font-family: var(--serif);
   font-style: italic;
-  font-size: 14px;
-  text-transform: none;
+  font-size: 18px;
   letter-spacing: -0.01em;
+  text-transform: none;
+  color: var(--ink);
+  /* keep the node title from pushing the tools group offscreen */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  line-height: 1.1;
 }
 
+/* Inline status pill — sits between identity and tools. */
 .status {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 3px 8px;
+  gap: 7px;
+  padding: 4px 9px;
   background: var(--ink);
   color: var(--bone);
+  font-family: var(--mono);
   font-size: 9.5px;
-  letter-spacing: 0.2em;
+  font-weight: 600;
+  letter-spacing: 0.22em;
   text-transform: uppercase;
+  flex: 0 0 auto;
 }
 .status__pulse {
   width: 7px;
@@ -1283,19 +1342,8 @@ button { font: inherit; color: inherit; }
    the per-pane hint so it doesn't collide with the hero typography behind. */
 .stage:has(.empty:not(.is-hidden)) .pane__body .pane__hint { display: none; }
 
-/* ───────── layout switch ───────── */
+/* ───────── topbar tools: layout switch + node actions ───────── */
 
-.topbar {
-  /* allow the center group to sit between crumbs and status */
-  gap: 12px;
-}
-.topbar__center {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  flex-shrink: 0;
-}
 .layout-switch {
   display: inline-flex;
   align-items: stretch;
@@ -1306,7 +1354,7 @@ button { font: inherit; color: inherit; }
 .layout-switch button {
   background: transparent;
   border: 0;
-  padding: 3px 7px;
+  padding: 4px 8px;
   cursor: pointer;
   color: var(--muted);
   display: inline-flex;
@@ -1334,16 +1382,16 @@ button { font: inherit; color: inherit; }
   border: 1.5px solid var(--ink);
   background: var(--bone-2);
   font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
-  font-size: 10px;
-  letter-spacing: 0.06em;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
   text-transform: lowercase;
 }
 .node-actions button {
   background: transparent;
   border: 0;
   border-right: 1px solid var(--ink);
-  padding: 0 8px;
-  min-height: 22px;
+  padding: 0 10px;
+  min-height: 26px;
   cursor: pointer;
   color: var(--muted);
   font: inherit;
