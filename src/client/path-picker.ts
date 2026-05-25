@@ -24,10 +24,16 @@ export function attachPathPicker(input: HTMLInputElement): PathPicker {
   list.setAttribute('role', 'listbox');
   list.hidden = true;
 
-  const wrap = input.parentElement;
-  if (wrap) {
-    if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
-    wrap.appendChild(list);
+  // Wrap the input in a positioning anchor so the dropdown pins directly under
+  // the input — not below the field's help text, which would let the dropdown
+  // overlap the modal footer below it.
+  const parent = input.parentElement;
+  const anchor = document.createElement('div');
+  anchor.className = 'path-picker-anchor';
+  if (parent) {
+    parent.insertBefore(anchor, input);
+    anchor.appendChild(input);
+    anchor.appendChild(list);
   }
 
   function hide() {

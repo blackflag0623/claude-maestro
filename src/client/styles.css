@@ -322,8 +322,11 @@ button { font: inherit; color: inherit; }
 
 .node-list { list-style: none; margin: 0; padding: 0 0 0 16px; }
 .node {
+  /* Five tracks: state-bar | agent-mark | title (ellipsis) | activity dot | kill button.
+     If you change the .node markup, keep the column count in sync — a mismatch
+     here makes a child wrap to a phantom second row in the sidebar. */
   display: grid;
-  grid-template-columns: 4px 1fr auto auto;
+  grid-template-columns: 4px auto 1fr auto auto;
   align-items: center;
   gap: 8px;
   padding: 5px 6px;
@@ -349,21 +352,22 @@ button { font: inherit; color: inherit; }
 .node[data-state="reconnecting"] .node__bar { background: var(--warn); animation: blink 800ms steps(2,end) infinite; }
 .node[data-state="exited"] .node__bar { background: var(--err); }
 .node__agent {
+  /* Compact 1-char agent mark. Borderless so it reads as typographic, not
+     chrome; color encodes which CLI is backing the node. */
   flex: 0 0 auto;
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-weight: 700;
+  font-size: 10px;
   line-height: 1;
-  letter-spacing: 0.12em;
+  letter-spacing: 0;
   text-transform: uppercase;
-  padding: 2px 4px;
-  border: 1px solid var(--ink);
-  background: var(--bone-2);
-  color: var(--ink);
+  width: 11px;
+  text-align: center;
+  color: var(--warn);
+  opacity: 0.9;
 }
-.node[data-agent="copilot"] .node__agent {
-  background: var(--ink);
-  color: var(--bone);
-}
+.node[data-agent="copilot"] .node__agent { color: var(--sky); }
+.node[aria-current="true"] .node__agent { opacity: 1; }
 .node__title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node__activity {
   width: 7px;
@@ -917,6 +921,10 @@ button { font: inherit; color: inherit; }
 
 /* ───────── path picker ───────── */
 
+.path-picker-anchor {
+  position: relative;
+  display: block;
+}
 .path-picker {
   list-style: none;
   margin: 0;
@@ -1189,6 +1197,9 @@ button { font: inherit; color: inherit; }
 .pane[aria-current="true"] .pane__body.is-empty {
   color: rgba(198, 255, 61, 0.55);
 }
+/* When the global empty-state hero is visible (single-pane, no node), suppress
+   the per-pane hint so it doesn't collide with the hero typography behind. */
+.stage:has(.empty:not(.is-hidden)) .pane__body .pane__hint { display: none; }
 
 /* ───────── layout switch ───────── */
 

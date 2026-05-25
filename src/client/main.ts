@@ -243,8 +243,10 @@ function agentLabel(a: AgentType): string {
 }
 
 function agentBadge(a: AgentType): string {
-  if (a === 'copilot') return 'cop';
-  return 'cla';
+  // Single-character mark. Color carries the rest of the meaning (see
+  // .node__agent in styles.css). Hover the chip to see the full label.
+  if (a === 'copilot') return 'g';
+  return 'c';
 }
 
 // ───────── drag-to-reorder ─────────
@@ -763,11 +765,41 @@ $btnAddServer.addEventListener('click', () => {
 
 const $app = document.querySelector('.app') as HTMLElement;
 
+// Platform-aware modifier glyphs for shortcut labels. Mac shows `⌘`, all other
+// platforms show `Ctrl`. We rewrite the legend in the empty hero and the topbar
+// button titles at boot so the displayed shortcuts match what actually works.
+// The keyboard handler itself accepts both ctrlKey and metaKey on every
+// platform — only the *display* is platform-conditional.
+const IS_MAC = /Mac|iPhone|iPad|iPod/i.test(
+  (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ??
+    navigator.platform ??
+    '',
+);
+
+/** Replace `⌘⇧` → `Ctrl+Shift+` and `⌘` → `Ctrl+` on non-Mac. No-op on Mac. */
+function modGlyph(s: string): string {
+  if (IS_MAC) return s;
+  return s.replace(/⌘⇧/g, 'Ctrl+Shift+').replace(/⌘/g, 'Ctrl+');
+}
+
+function localizeShortcuts() {
+  // Rewrite legend text in the empty hero (and any other element marked with
+  // [data-shortcut]) so non-Mac users see Ctrl-prefixed labels.
+  for (const el of document.querySelectorAll<HTMLElement>('.empty__legend span')) {
+    el.textContent = modGlyph(el.textContent ?? '');
+  }
+  for (const el of document.querySelectorAll<HTMLElement>('[title*="⌘"]')) {
+    const t = el.getAttribute('title');
+    if (t) el.setAttribute('title', modGlyph(t));
+  }
+}
+localizeShortcuts();
+
 function applySidebarState() {
   const collapsed = state.sidebarCollapsed;
   $app.dataset.sidebar = collapsed ? 'collapsed' : 'expanded';
   $btnSidebar.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-  $btnSidebar.title = collapsed ? 'show sidebar (⌘B)' : 'hide sidebar (⌘B)';
+  $btnSidebar.title = modGlyph(collapsed ? 'show sidebar (⌘B)' : 'hide sidebar (⌘B)');
 }
 
 function toggleSidebar() {
