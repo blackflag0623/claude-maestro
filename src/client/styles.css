@@ -323,12 +323,14 @@ button { font: inherit; color: inherit; }
   cursor: pointer;
   color: var(--ink);
   line-height: 1;
-  transition: background 80ms linear, color 80ms linear;
+  transition: background 80ms linear, color 80ms linear, border-color 80ms linear;
 }
-.popup-btn:hover { background: var(--ink); color: var(--bone); }
+/* Uniform hover treatment across all three popup buttons: invert to ink fill
+   with bone text. Rest-state semantic colors (lime primary, red danger text)
+   are preserved so each button still reads as itself before hover. */
+.popup-btn:hover { background: var(--ink); color: var(--bone); border-color: var(--ink); }
 .popup-btn--primary { background: var(--lime); }
-.popup-btn--primary:hover { background: var(--ink); color: var(--lime); }
-.popup-btn--danger:hover { background: var(--err); color: var(--bone); border-color: var(--err); }
+.popup-btn--danger { color: var(--err); }
 
 .sidebar__head-actions {
   display: inline-flex;
