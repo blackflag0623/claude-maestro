@@ -140,6 +140,14 @@ setInterval(tickUptime, 1000);
 tickUptime();
 
 function renderSidebar() {
+  // If a popup is open (cursor inside a server card), defer the re-render
+  // until the popup closes — otherwise we'd rip the user's hover target out
+  // of the DOM mid-interaction.
+  if (activePopupHost) {
+    sidebarRenderPending = true;
+    return;
+  }
+  sidebarRenderPending = false;
   $serverList.innerHTML = '';
   if (state.servers.length === 0) {
     const li = document.createElement('li');
@@ -152,6 +160,7 @@ function renderSidebar() {
     $serverList.appendChild(renderServer(srv));
   }
 }
+let sidebarRenderPending = false;
 
 function renderServer(srv: ServerEntry): HTMLLIElement {
   const rt = servers.get(srv.id);
@@ -224,6 +233,11 @@ function closeServerPopup(): void {
   }
   activePopupHost.classList.remove('is-popup-open');
   activePopupHost = null;
+  // Flush any sidebar render that was deferred while the popup was open.
+  if (sidebarRenderPending) {
+    sidebarRenderPending = false;
+    renderSidebar();
+  }
 }
 
 function scheduleClose(delay = 180): void {
@@ -291,10 +305,23 @@ function wireServerPopup(li: HTMLElement): void {
   });
 }
 
-// Global listeners: hide popup on scroll/resize/Escape so it can't drift away
-// from its anchor row.
-window.addEventListener('scroll', () => closeServerPopup(), true);
-window.addEventListener('resize', () => closeServerPopup());
+// Global listeners. We DO NOT use a capture-phase scroll listener — that would
+// close the popup whenever the xterm terminal scrolls due to PTY output. The
+// popup is anchored to a row inside the sidebar, so only sidebar scrolling
+// affects its position; on sidebar scroll we reposition rather than close.
+const $sidebarEl = document.querySelector<HTMLElement>('.sidebar');
+$sidebarEl?.addEventListener('scroll', () => {
+  if (!activePopupHost) return;
+  const row = activePopupHost.querySelector<HTMLElement>('.server__row');
+  if (!row) return;
+  const r = row.getBoundingClientRect();
+  // Close only if the anchor row has scrolled completely out of view.
+  if (r.bottom < 0 || r.top > window.innerHeight) closeServerPopup();
+  else positionServerPopup(activePopupHost);
+}, { passive: true });
+window.addEventListener('resize', () => {
+  if (activePopupHost) positionServerPopup(activePopupHost);
+});
 window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeServerPopup(); });
 
 function renderNodeRow(ref: NodeRef, info?: SessionInfo): HTMLLIElement {
