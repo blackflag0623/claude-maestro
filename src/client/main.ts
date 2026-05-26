@@ -140,10 +140,14 @@ setInterval(tickUptime, 1000);
 tickUptime();
 
 function renderSidebar() {
-  // If a popup is open (cursor inside a server card), defer the re-render
-  // until the popup closes — otherwise we'd rip the user's hover target out
-  // of the DOM mid-interaction.
-  if (activePopupHost) {
+  // If a popup is open (cursor inside a server card) OR a drag is in flight,
+  // defer the re-render until the interaction ends — otherwise we'd rip the
+  // user's hover target / drag source out of the DOM mid-interaction. The
+  // drag case is especially nasty: tearing down the dragged LI strands the
+  // browser's drag image while we rebuild fresh siblings, so the user sees
+  // ghost duplicates and cancel-restore re-appends detached old children
+  // alongside the new ones.
+  if (activePopupHost || dragging) {
     sidebarRenderPending = true;
     return;
   }
@@ -444,8 +448,9 @@ function attachDrag(el: HTMLElement, ref: DragRef) {
   el.addEventListener('dragend', () => {
     el.classList.remove('is-dragging');
     document.querySelectorAll('.is-drop-target').forEach((n) => n.classList.remove('is-drop-target'));
-    // Cancelled drag (no successful drop fired): restore the original DOM order
-    // so the visual position matches the unchanged state.
+    // Cancelled drag (no successful drop fired — e.g. Esc, drop outside any
+    // valid target): restore the original DOM order so the visual position
+    // matches the unchanged state.
     if (!dragDropCommitted && dragOriginalOrder && dragOriginalParent) {
       const parent = dragOriginalParent;
       const order = dragOriginalOrder;
@@ -455,10 +460,19 @@ function attachDrag(el: HTMLElement, ref: DragRef) {
     dragOriginalOrder = null;
     dragOriginalParent = null;
     dragDropCommitted = false;
+    // Catch up any polling-driven sidebar re-renders that were deferred while
+    // the drag was active. The state is now in sync with the DOM so this is
+    // a no-op visually, but it re-binds handlers cleanly.
+    if (sidebarRenderPending) scheduleRender();
   });
   el.addEventListener('dragover', (e) => {
     if (!dragging || dragging.kind !== ref.kind) return;
     if (ref.kind === 'node' && dragging.kind === 'node' && dragging.serverId !== ref.serverId) return;
+    // preventDefault unconditionally so the dragged element itself remains a
+    // valid drop target. Otherwise, releasing the mouse over the dragged LI
+    // (the most natural release point — the cursor follows the drag image)
+    // fires no drop event, the dragend cancel-restore kicks in, and all the
+    // user's FLIP-driven reordering snaps back to the original order.
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
     // Live DOM-only reorder with a FLIP animation so siblings slide smoothly
@@ -481,54 +495,94 @@ function attachDrag(el: HTMLElement, ref: DragRef) {
     e.preventDefault();
     e.stopPropagation();
     dragDropCommitted = true;
-    const before = isAbove(e, el);
-    if (dragging.kind === 'server' && ref.kind === 'server') {
-      reorderServer(dragging.serverId, ref.serverId, before);
-    } else if (dragging.kind === 'node' && ref.kind === 'node') {
-      if (dragging.serverId !== ref.serverId) return;
-      reorderNode(ref.serverId, dragging.sessionId, ref.sessionId, before);
-    }
+    // Commit ordering from the LIVE DOM rather than recomputing from the
+    // drop target's index in state. The DOM was reordered in real time by
+    // dragover-FLIP and is the source of truth for what the user saw at the
+    // moment of release. Using state-relative indices here would drift
+    // because: (a) the state array is still in its original order, (b)
+    // `isAbove(drop target)` is measured against the post-FLIP layout, and
+    // (c) the user may have released over the dragged element itself, which
+    // would otherwise mean "no target found".
+    commitDragOrderFromDom(ref);
   });
 }
 
+/** Reconcile state ordering with the current DOM ordering of the sidebar
+ *  list that owns this drag. Persists and schedules a re-render. */
+function commitDragOrderFromDom(ref: DragRef) {
+  if (ref.kind === 'server') {
+    const ids = Array.from($serverList.children)
+      .map((c) => (c as HTMLElement).dataset.serverId)
+      .filter((x): x is string => !!x);
+    const byId = new Map(state.servers.map((s) => [s.id, s]));
+    const next: ServerEntry[] = [];
+    for (const id of ids) {
+      const s = byId.get(id);
+      if (s) {
+        next.push(s);
+        byId.delete(id);
+      }
+    }
+    // Append any servers the DOM didn't list (defensive — shouldn't happen
+    // since renders are paused during the drag).
+    for (const s of byId.values()) next.push(s);
+    if (next.length !== state.servers.length) return;
+    state.servers = next;
+    persist();
+    scheduleRender();
+    return;
+  }
+  // node drag: find the .node-list containing the dragged LI
+  const draggedLi = $serverList.querySelector<HTMLElement>(
+    `.node[data-server-id="${ref.serverId}"][data-session-id="${ref.sessionId}"]`,
+  );
+  const list = draggedLi?.parentElement;
+  if (!list) return;
+  const sids = Array.from(list.children)
+    .map((c) => (c as HTMLElement).dataset.sessionId)
+    .filter((x): x is string => !!x);
+  const known = state.knownNodes[ref.serverId] ?? [];
+  const bySid = new Map(known.map((n) => [n.sessionId, n]));
+  const next: NodeRef[] = [];
+  for (const sid of sids) {
+    const n = bySid.get(sid);
+    if (n) {
+      next.push(n);
+      bySid.delete(sid);
+    }
+  }
+  for (const n of bySid.values()) next.push(n);
+  if (next.length !== known.length) return;
+  state.knownNodes = { ...state.knownNodes, [ref.serverId]: next };
+  persist();
+  scheduleRender();
+}
+
 function isAbove(e: DragEvent, el: HTMLElement): boolean {
+  // Use the LAYOUT midline, not the visual midline. `getBoundingClientRect`
+  // reflects any active CSS transform — including the FLIP slide animation
+  // we apply during dragover-driven reorders. During that 180 ms slide a
+  // sibling is visually still in its old slot while its DOM position has
+  // already moved to the new one, so a visual-midline threshold oscillates
+  // and bumps the dragged element back and forth between adjacent slots.
+  // The most visible symptom: dragging to position #1 (top of list) is
+  // impossible because the moment the dragged element lands at slot 0, the
+  // sibling animating out of slot 0 is hit-tested in the lower half of its
+  // visual rect and immediately bumps the dragged element back to slot 1.
+  // Subtract the current translateY to get the untransformed top.
   const r = el.getBoundingClientRect();
-  return e.clientY < r.top + r.height / 2;
-}
-
-function moveWithin<T>(arr: T[], from: number, to: number): T[] {
-  if (from === to || from < 0 || to < 0 || from >= arr.length || to > arr.length) return arr;
-  const next = arr.slice();
-  const [item] = next.splice(from, 1);
-  next.splice(to > from ? to - 1 : to, 0, item!);
-  return next;
-}
-
-function reorderServer(draggedId: string, targetId: string, before: boolean) {
-  if (draggedId === targetId) return;
-  const from = state.servers.findIndex((s) => s.id === draggedId);
-  const targetIdx = state.servers.findIndex((s) => s.id === targetId);
-  if (from < 0 || targetIdx < 0) return;
-  const to = before ? targetIdx : targetIdx + 1;
-  const next = moveWithin(state.servers, from, to);
-  if (next === state.servers) return;
-  state.servers = next;
-  persist();
-  scheduleRender();
-}
-
-function reorderNode(serverId: string, draggedSid: string, targetSid: string, before: boolean) {
-  if (draggedSid === targetSid) return;
-  const list = state.knownNodes[serverId] ?? [];
-  const from = list.findIndex((n) => n.sessionId === draggedSid);
-  const targetIdx = list.findIndex((n) => n.sessionId === targetSid);
-  if (from < 0 || targetIdx < 0) return;
-  const to = before ? targetIdx : targetIdx + 1;
-  const next = moveWithin(list, from, to);
-  if (next === list) return;
-  state.knownNodes = { ...state.knownNodes, [serverId]: next };
-  persist();
-  scheduleRender();
+  let topY = r.top;
+  const t = getComputedStyle(el).transform;
+  if (t && t !== 'none') {
+    if (t.startsWith('matrix3d(')) {
+      const parts = t.slice(9, -1).split(',').map((s) => parseFloat(s));
+      topY -= parts[13] ?? 0;
+    } else if (t.startsWith('matrix(')) {
+      const parts = t.slice(7, -1).split(',').map((s) => parseFloat(s));
+      topY -= parts[5] ?? 0;
+    }
+  }
+  return e.clientY < topY + r.height / 2;
 }
 
 function renderTopbar() {
@@ -853,8 +907,9 @@ function buildPane(slot: number): HTMLElement {
     if (!dragging || dragging.kind !== 'node') return;
     e.preventDefault();
     e.stopPropagation();
-    const list = state.knownNodes[dragging.serverId];
-    const dropped = list?.find((n) => n.sessionId === dragging!.sessionId);
+    const drag = dragging;
+    const list = state.knownNodes[drag.serverId];
+    const dropped = list?.find((n) => n.sessionId === drag.sessionId);
     if (!dropped) return;
     placeInSlot(slot, dropped);
   });
