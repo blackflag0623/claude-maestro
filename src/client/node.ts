@@ -75,7 +75,11 @@ export class TerminalNode {
       theme: {
         background: TERM_BG,
         foreground: TERM_FG,
-        cursor: TERM_BG,
+        // Visible cursor color. For Claude sessions xterm's cursor is hidden
+        // via CSS (Claude draws an inline reverse-video block as its caret);
+        // for Copilot CLI the user relies on xterm's native cursor — we set
+        // it to the acid-lime accent so the caret matches the portal theme.
+        cursor: TERM_LIME,
         cursorAccent: TERM_BG,
         selectionBackground: TERM_LIME + '44',
         black: TERM_BG,
@@ -386,6 +390,11 @@ ${body}
       }
       if (msg.type === 'attached') {
         this.session = msg.session;
+        // Tag the host with the agent type so the cursor-hiding CSS rules
+        // (which only fire for Claude — see styles.css) can disambiguate.
+        // Copilot CLI relies on xterm's native cursor to show where input
+        // lands; Claude draws its own inline reverse-video block.
+        this.el.dataset.agent = msg.session.agentType ?? 'claude';
         if (msg.scrollback) {
           // Suppress the jump-pill new-line counter while we replay the
           // server's scrollback ring — otherwise every reconnect would
