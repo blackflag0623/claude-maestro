@@ -118,6 +118,12 @@ button { font: inherit; color: inherit; }
   background-image: var(--grain);
   background-blend-mode: multiply;
   position: relative;
+  /* Sidebar paints above the main column. Without this, the
+     `view-transition-name`-induced stacking contexts on .sidebar and .main
+     both default to z-index:auto and paint in DOM order — so the floating
+     server popup (which is `position: fixed` but stacking-scoped to .sidebar)
+     ends up under anything inside .main, including the terminal canvas. */
+  z-index: 2;
   overflow: hidden;
   min-width: 0;
 }
