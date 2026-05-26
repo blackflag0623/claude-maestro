@@ -4,6 +4,7 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { SearchAddon } from '@xterm/addon-search';
 import { SerializeAddon } from '@xterm/addon-serialize';
+import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 import type { ClientMessage, ServerMessage, SessionInfo, SessionActivity } from '../shared/protocol';
 import type { MaestroApi } from '../client-shared/api';
@@ -91,6 +92,13 @@ export class TerminalNode {
     this.term.loadAddon(this.fit);
     this.term.loadAddon(this.search);
     this.term.loadAddon(this.serializer);
+    // Unicode 11 width tables — without this xterm uses Unicode 6 widths, so
+    // modern emoji, CJK and box-drawing glyphs (which Claude / Copilot emit
+    // freely) get the wrong cell width and misalign columns. Must be loaded
+    // and activated BEFORE the first `term.write()` so the buffer is parsed
+    // with the right widths from the very first byte.
+    this.term.loadAddon(new Unicode11Addon());
+    this.term.unicode.activeVersion = '11';
     // Web-links: hover-underline + Ctrl/Cmd+click to open in a new tab.
     // Default URL regex covers `http(s)://` only — enough for what Claude
     // typically prints (doc links, PRs, issues).
