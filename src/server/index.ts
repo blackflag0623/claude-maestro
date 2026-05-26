@@ -529,7 +529,11 @@ const CSP = [
   "script-src 'self' https://cdn.jsdelivr.net",
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "font-src 'self' https://fonts.gstatic.com",
-  "img-src 'self' data:",
+  // `blob:` is required for `@xterm/addon-image` — the renderer creates
+  // ObjectURLs for decoded sixel / iTerm IIP frames before painting them
+  // onto the overlay canvas. Without `blob:` here the addon silently fails
+  // in production builds (Vite dev is more permissive about CSP).
+  "img-src 'self' data: blob:",
   "connect-src 'self' ws: wss: http: https:",
   "frame-ancestors 'none'",
   "base-uri 'self'",

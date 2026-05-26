@@ -102,7 +102,7 @@ export function buildSearchOverlay(search: SearchAddon): SearchOverlay {
     delete count.dataset.state;
   }
 
-  search.onDidChangeResultsCount?.((e) => {
+  search.onDidChangeResults((e) => {
     if (!open) return;
     if (e.resultCount === 0) {
       setCountText(input.value ? '0' : '—');

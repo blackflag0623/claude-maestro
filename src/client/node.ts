@@ -5,6 +5,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import { SearchAddon } from '@xterm/addon-search';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
+import { ImageAddon, type IImageAddonOptions } from '@xterm/addon-image';
 import '@xterm/xterm/css/xterm.css';
 import type { ClientMessage, ServerMessage, SessionInfo, SessionActivity } from '../shared/protocol';
 import type { MaestroApi } from '../client-shared/api';
@@ -35,6 +36,7 @@ export class TerminalNode {
   private readonly search = new SearchAddon();
   private readonly serializer = new SerializeAddon();
   private readonly searchOverlay: SearchOverlay;
+  private readonly imageAddon: ImageAddon;
   private webgl: WebglAddon | null = null;
   private ws: WebSocket | null = null;
   private reconnectDelay = 500;
@@ -104,6 +106,30 @@ export class TerminalNode {
     // with the right widths from the very first byte.
     this.term.loadAddon(new Unicode11Addon());
     this.term.unicode.activeVersion = '11';
+    // Inline-image support: sixel + iTerm IIP escape sequences are decoded
+    // by addon-image and rendered onto an overlay canvas. Tools like
+    // `imgcat`, `viu`, matplotlib in sixel mode, and various TUI plot
+    // libraries depend on this. MUST be loaded before `term.open()` per
+    // the addon's docs — it hooks the parser at addon-load time and won't
+    // intercept escapes emitted before that point.
+    //
+    // Limits are tightened well below upstream defaults so a runaway agent
+    // can't blow the renderer's memory budget — on a phone or a tab kept
+    // open for days, the defaults (128 MB storage, 16 Mpx, 25 MB sixel)
+    // are too generous.
+    const imageOptions: IImageAddonOptions = {
+      enableSizeReports: true,
+      pixelLimit: 4_096 * 4_096, // 16 Mpx, sufficient for any realistic terminal-emitted image
+      storageLimit: 16, // MB of decoded image data retained in scrollback
+      showPlaceholder: true,
+      sixelSizeLimit: 8 * 1024 * 1024,
+      sixelPaletteLimit: 256,
+      sixelScrolling: true,
+      iipSupport: true,
+      iipSizeLimit: 8 * 1024 * 1024,
+    };
+    this.imageAddon = new ImageAddon(imageOptions);
+    this.term.loadAddon(this.imageAddon);
     // Web-links: hover-underline + Ctrl/Cmd+click to open in a new tab.
     // Default URL regex covers `http(s)://` only — enough for what Claude
     // typically prints (doc links, PRs, issues).
@@ -316,6 +342,9 @@ ${body}
     this.indicator.stop();
     try {
       this.webgl?.dispose();
+    } catch {}
+    try {
+      this.imageAddon.dispose();
     } catch {}
     try {
       this.ws?.close();
