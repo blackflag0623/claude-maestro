@@ -774,7 +774,7 @@ button { font: inherit; color: inherit; }
   color: var(--ink);
   font: inherit;
   padding: 6px 8px;
-  width: 180px;
+  width: 150px;
   outline: none;
 }
 .search-overlay__input::placeholder {
@@ -786,12 +786,41 @@ button { font: inherit; color: inherit; }
 .search-overlay__count {
   display: inline-flex;
   align-items: center;
-  padding: 0 8px;
+  padding: 0 7px;
   border-left: 1px solid color-mix(in srgb, var(--ink) 25%, transparent);
   color: color-mix(in srgb, var(--ink) 70%, transparent);
   min-width: 40px;
   justify-content: center;
   font-variant-numeric: tabular-nums;
+}
+.search-overlay__count[data-state="err"] {
+  color: var(--err);
+  font-style: italic;
+}
+.search-overlay__toggle {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-left: 1px solid color-mix(in srgb, var(--ink) 25%, transparent);
+  color: color-mix(in srgb, var(--ink) 55%, transparent);
+  font: inherit;
+  font-size: 10.5px;
+  padding: 0 6px;
+  cursor: pointer;
+  min-width: 22px;
+  letter-spacing: 0.02em;
+}
+.search-overlay__toggle:hover:not(:disabled) {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+}
+.search-overlay__toggle[aria-pressed="true"] {
+  color: var(--ink);
+  background: var(--lime);
+}
+.search-overlay__toggle:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 .search-overlay__btn {
   appearance: none;
