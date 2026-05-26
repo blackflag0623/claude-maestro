@@ -24,23 +24,25 @@ export type SpawnMode = 'new' | 'resume';
  *  fields below are populated only for agents that use them. The object is
  *  passed live (mutable) so a strategy can record a post-spawn discovery
  *  (e.g. Copilot agency mode) by writing back onto the same target. */
+/** The subset of session state a strategy needs to spawn / read for a
+ *  session. The maestro session id (`id`) is always present; everything
+ *  agent-specific lives inside `agentState`, an opaque-to-the-server blob
+ *  the strategy reads and writes through. The server persists whatever the
+ *  strategy stores there as a single JSON object and rehydrates it on
+ *  reload. Strategies should pick stable string keys for their fields. */
 export interface SpawnTarget {
   id: string;
   cwd: string;
   cols: number;
   rows: number;
-  /** For Copilot: the agent's own session uuid as recorded by the server, if
-   *  known. Direct mode: equals `id` (the historical invariant). Agency mode:
-   *  may be `undefined` on first spawn (will be discovered post-spawn) and is
-   *  set to the agency-issued uuid on subsequent spawns. Ignored by non-
-   *  Copilot agents. */
-  copilotSessionId?: string;
-  /** Called by the Copilot strategy after discovering an agency-issued uuid
-   *  for a freshly-spawned agency session. The server persists this to
-   *  `sessions.json` and updates the live session record. Strategies SHOULD
-   *  also mutate `target.copilotSessionId` so downstream consumers (the
-   *  reader) see the change immediately. No-op for non-Copilot agents. */
-  onCopilotSessionId?: (id: string) => void;
+  /** Mutable agent-specific state. Strategies read and (via
+   *  `onAgentStateChange`) mutate this; the server snapshots it to disk. */
+  agentState: Record<string, unknown>;
+  /** Strategies call this after mutating `agentState` to ask the server to
+   *  persist the new snapshot to `sessions.json`. The server applies the
+   *  delta over its in-memory copy too, so callers can read back from
+   *  `target.agentState` immediately. */
+  onAgentStateChange?: (state: Record<string, unknown>) => void;
 }
 
 /** Callbacks an `AgentReader` invokes when it observes new events. The server
@@ -82,6 +84,21 @@ export interface AgentStrategy {
   /** Human-readable display name (shown in the new-node modal, the agent
    *  badges in sidebars, etc.). */
   readonly displayName: string;
+
+  /** True if PreToolUse-style permission gating is available for this agent
+   *  (the server bridges decisions to the mobile chat). Defaults to false. */
+  readonly supportsPermissionGating?: boolean;
+
+  /** Build the initial agentState blob for a freshly-created session. The
+   *  returned object is persisted with the session record and passed to
+   *  every subsequent `spawn` / `createReader` call. Default: empty. */
+  initialAgentState?(id: string): Record<string, unknown>;
+
+  /** Inspect a rehydrated agentState blob from disk. Throw to refuse load
+   *  (the server will surface the message and skip that session). Default:
+   *  accept anything. Used by Copilot to fail-closed on launch-mode
+   *  mismatches between persisted state and the current process config. */
+  validateAgentState?(state: Record<string, unknown>): void;
 
   /** Spawn the agent process. The caller owns the returned IPty and wires
    *  `onData` / `onExit`. Throws on spawn failure with a clear message. */

@@ -1,9 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { StringDecoder } from 'node:string_decoder';
 import type { ChatMessage } from '../shared/protocol.js';
 import { debug } from './debug.js';
+import { JsonlTail, parseJsonl } from './jsonl-tail.js';
 
 /** Convert an absolute cwd to the slug Claude uses for its project directory.
  *  Observed rule (Claude Code 2.1.x on Windows):
@@ -104,24 +104,19 @@ function entryToChatMessage(entry: unknown): ChatMessage | null {
   return null;
 }
 
-/** Per-session tail state. The transcript is append-only JSONL; we remember
- *  how many bytes we've consumed and only parse newly-arrived bytes on each
- *  poll. The file is opened fresh each read so external truncation/rotation
- *  surfaces as size shrinking, in which case we reset and re-read whole. */
+/** Per-session tail state. The transcript is append-only JSONL; we read it
+ *  via JsonlTail (offset + StringDecoder + pread/fallback) and re-locate the
+ *  file on each read so a delayed first write or rotation surfaces cleanly. */
 export class TranscriptReader {
-  private offset = 0;
-  private partial = ''; // incomplete trailing line carried across reads
   private path: string | null = null;
-  // StringDecoder preserves incomplete multi-byte UTF-8 sequences across
-  // reads — a chunk boundary mid-codepoint would otherwise become a
-  // replacement char and corrupt the JSONL stream forever (since `offset`
-  // already advanced past those bytes).
-  private decoder = new StringDecoder('utf8');
+  private tail: JsonlTail;
 
   constructor(
     private readonly sessionId: string,
     private readonly cwd: string,
-  ) {}
+  ) {
+    this.tail = new JsonlTail(this.sessionId.slice(0, 8));
+  }
 
   /** Read the entire transcript (used for history replay on first attach). */
   readAll(): ChatMessage[] {
@@ -134,10 +129,8 @@ export class TranscriptReader {
       return [];
     }
     this.path = p;
-    this.offset = Buffer.byteLength(buf, 'utf8');
-    this.partial = '';
-    this.decoder = new StringDecoder('utf8');
-    return parseJsonl(buf);
+    this.tail.markConsumed(Buffer.byteLength(buf, 'utf8'));
+    return parseJsonl(buf, entryToChatMessage);
   }
 
   /** Read whatever appended since the last read. Returns ChatMessages parsed
@@ -148,93 +141,17 @@ export class TranscriptReader {
       debug(`[transcript] ${this.sessionId.slice(0, 8)} no transcript file found yet`);
       return [];
     }
-    let st: fs.Stats;
-    try {
-      st = fs.statSync(p);
-    } catch (err) {
-      debug(`[transcript] ${this.sessionId.slice(0, 8)} stat failed: ${(err as Error).message}`);
-      return [];
-    }
-    if (st.size === this.offset) {
-      debug(`[transcript] ${this.sessionId.slice(0, 8)} no growth (size=${st.size})`);
-      return [];
-    }
-    if (st.size < this.offset) {
-      debug(`[transcript] ${this.sessionId.slice(0, 8)} shrank ${this.offset}→${st.size}, restarting`);
-      this.offset = 0;
-      this.partial = '';
-      this.decoder = new StringDecoder('utf8');
-    }
-    const length = st.size - this.offset;
-    let chunk: string;
-    // Prefer pread (openSync+readSync at offset) but fall back to whole-file
-    // read on Windows where the writer's exclusive handle can block us.
-    try {
-      const fd = fs.openSync(p, 'r');
-      try {
-        const buf = Buffer.allocUnsafe(length);
-        const read = fs.readSync(fd, buf, 0, length, this.offset);
-        chunk = this.partial + this.decoder.write(buf.slice(0, read));
-        this.offset += read;
-      } finally {
-        fs.closeSync(fd);
-      }
-    } catch (err) {
-      debug(`[transcript] ${this.sessionId.slice(0, 8)} pread failed (${(err as Error).message}), falling back to readFile`);
-      try {
-        const whole = fs.readFileSync(p, 'utf8');
-        const totalBytes = Buffer.byteLength(whole, 'utf8');
-        if (totalBytes < this.offset) {
-          this.offset = 0;
-          this.partial = '';
-        }
-        // readFileSync handles UTF-8 framing for the whole file, so resync the
-        // decoder rather than feeding it sliced bytes — sliced bytes could
-        // start mid-codepoint and corrupt the next pread cycle.
-        this.decoder = new StringDecoder('utf8');
-        const tail = Buffer.from(whole, 'utf8').slice(this.offset).toString('utf8');
-        chunk = this.partial + tail;
-        this.offset = totalBytes;
-      } catch (err2) {
-        debug(`[transcript] ${this.sessionId.slice(0, 8)} fallback also failed: ${(err2 as Error).message}`);
-        return [];
-      }
-    }
-    const lastNl = chunk.lastIndexOf('\n');
-    if (lastNl < 0) {
-      this.partial = chunk;
-      return [];
-    }
-    this.partial = chunk.slice(lastNl + 1);
-    const msgs = parseJsonl(chunk.slice(0, lastNl));
-    debug(`[transcript] ${this.sessionId.slice(0, 8)} read ${length} bytes → ${msgs.length} message(s) (offset now ${this.offset})`);
+    const complete = this.tail.read(p);
+    if (!complete) return [];
+    const msgs = parseJsonl(complete, entryToChatMessage);
+    debug(`[transcript] ${this.sessionId.slice(0, 8)} → ${msgs.length} message(s)`);
     return msgs;
   }
 
   private locate(): string | null {
     if (this.path && fs.existsSync(this.path)) return this.path;
     const found = findTranscript(this.sessionId, this.cwd);
-    if (found) {
-      this.path = found;
-      // Reset offset when we first locate; readAll/readIncremental decide how to use it.
-    }
+    if (found) this.path = found;
     return this.path;
   }
-}
-
-function parseJsonl(buf: string): ChatMessage[] {
-  const out: ChatMessage[] = [];
-  for (const line of buf.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    const m = entryToChatMessage(parsed);
-    if (m) out.push(m);
-  }
-  return out;
 }

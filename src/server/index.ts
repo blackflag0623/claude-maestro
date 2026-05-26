@@ -23,7 +23,6 @@ import type {
 import { AGENT_TYPES, ASK_UQ_ANSWER_PREFIX } from '../shared/protocol.js';
 import { getStrategy, type AgentReader, type SpawnTarget } from './agents/index.js';
 import { initAgentEnvironments } from './agents/all.js';
-import { COPILOT_LAUNCH_MODE } from './agents/copilot.js';
 import {
   requestVerdict,
   resolveVerdict,
@@ -73,17 +72,11 @@ interface PersistedSession {
   /** Which CLI agent backs this session. Defaults to `'claude'` on load for
    *  records persisted before the agent abstraction was introduced. */
   agentType: AgentType;
-  /** Copilot only: which launch mode this session was created with. Affects
-   *  spawn argv shape and how `copilotSessionId` is interpreted. Missing →
-   *  treat as `'direct'` for back-compat with sessions persisted before the
-   *  agency launch mode was introduced. */
-  copilotLaunchMode?: 'direct' | 'agency';
-  /** Copilot only: the agent's own session uuid. In direct mode this equals
-   *  `id`. In agency mode it is the agency-issued uuid, populated post-spawn
-   *  by the strategy after watching `~/.copilot/session-state/`. Missing →
-   *  not yet discovered (agency-new pre-discovery) OR direct mode (use `id`
-   *  as the fallback at spawn time). */
-  copilotSessionId?: string;
+  /** Per-agent opaque state, owned by the strategy module. Anything the
+   *  strategy needs to round-trip across maestro restarts goes here. Older
+   *  records may carry legacy top-level `copilotLaunchMode` /
+   *  `copilotSessionId` fields; we migrate those on load. */
+  agentState: Record<string, unknown>;
 }
 
 interface Session extends PersistedSession {
@@ -155,8 +148,7 @@ function persist() {
     createdAt: s.createdAt,
     hasResumeData: s.hasResumeData,
     agentType: s.agentType,
-    copilotLaunchMode: s.copilotLaunchMode,
-    copilotSessionId: s.copilotSessionId,
+    agentState: s.agentState,
   }));
   try {
     fs.mkdirSync(STORE_DIR, { recursive: true });
@@ -189,6 +181,29 @@ function loadPersisted() {
       console.warn(`[maestro] skipping session ${p.id} with unknown agentType: ${String(at)}`);
       continue;
     }
+    // Migrate legacy top-level Copilot fields into agentState. Older records
+    // wrote `copilotLaunchMode` / `copilotSessionId` directly on the record.
+    const legacy = p as Partial<PersistedSession> & {
+      copilotLaunchMode?: 'direct' | 'agency';
+      copilotSessionId?: string;
+    };
+    let agentState: Record<string, unknown> =
+      (p.agentState && typeof p.agentState === 'object' ? p.agentState : {}) as Record<string, unknown>;
+    if (agentType === 'copilot' && Object.keys(agentState).length === 0) {
+      agentState = {
+        copilotLaunchMode: legacy.copilotLaunchMode,
+        copilotSessionId: legacy.copilotSessionId,
+      };
+    }
+    // Strategy can reject the rehydrated state (e.g. Copilot launch-mode
+    // mismatch). We surface that as a warning and skip the session — better
+    // than failing later inside spawn with an opaque error.
+    try {
+      getStrategy(agentType).validateAgentState?.(agentState);
+    } catch (err) {
+      console.warn(`[maestro] skipping session ${p.id}: ${(err as Error).message}`);
+      continue;
+    }
     const scrollback = new ScrollbackBuffer(SCROLLBACK_BYTES);
     loadScrollback(p.id, scrollback);
     sessions.set(p.id, {
@@ -198,8 +213,7 @@ function loadPersisted() {
       createdAt: p.createdAt ?? Date.now(),
       hasResumeData: p.hasResumeData ?? false,
       agentType,
-      copilotLaunchMode: p.copilotLaunchMode,
-      copilotSessionId: p.copilotSessionId,
+      agentState,
       term: null,
       cols: 120,
       rows: 30,
@@ -489,38 +503,22 @@ const READER_DISPOSE_GRACE_MS = 1500;
 function spawnAgent(s: Session, mode: 'new' | 'resume') {
   const strategy = getStrategy(s.agentType);
 
-  // Copilot launch-mode mismatch guard: a session persisted under one mode
-  // (direct vs agency) cannot be revived in the other — the spawn argv shape
-  // and uuid ownership differ. Silent-fresh-start would silently lose
-  // conversation history, so fail closed with a clear message.
-  if (s.agentType === 'copilot') {
-    const persistedMode = s.copilotLaunchMode ?? 'direct';
-    if (persistedMode !== COPILOT_LAUNCH_MODE) {
-      throw new Error(
-        `Copilot session ${s.id} was created in '${persistedMode}' launch mode, ` +
-          `but this maestro process is running in '${COPILOT_LAUNCH_MODE}' mode. ` +
-          `To resume this session, restart maestro with the original mode ` +
-          `(set/unset MAESTRO_COPILOT_AGENCY and MAESTRO_COPILOT_BIN accordingly). ` +
-          `To start over, delete the session and create a new one.`,
-      );
-    }
-    // Direct-mode sessions: copilotSessionId is always equal to id. For old
-    // pre-feature records this field is undefined on disk; backfill so the
-    // reader's path resolution finds the events.jsonl immediately.
-    if (persistedMode === 'direct' && !s.copilotSessionId) {
-      s.copilotSessionId = s.id;
-    }
-  }
+  // Strategy gets one final chance to refuse the agentState — used by Copilot
+  // to fail-closed on launch-mode mismatch. (Already enforced on load, but
+  // defensive against in-memory tampering or future state mutations.)
+  strategy.validateAgentState?.(s.agentState);
 
   const target: SpawnTarget = {
     id: s.id,
     cwd: s.cwd,
     cols: s.cols,
     rows: s.rows,
-    copilotSessionId: s.copilotSessionId,
-    onCopilotSessionId: (copilotSessionId: string) => {
-      if (s.copilotSessionId === copilotSessionId) return;
-      s.copilotSessionId = copilotSessionId;
+    agentState: s.agentState,
+    onAgentStateChange: (next: Record<string, unknown>) => {
+      // Strategy mutates target.agentState in place AND calls back so we can
+      // persist. The reference is shared (target.agentState === s.agentState)
+      // so the in-memory copy already reflects the change; this just snapshots.
+      s.agentState = next;
       persist();
     },
   };
@@ -597,14 +595,8 @@ function createSession(body: CreateSessionBody): Session {
     createdAt: Date.now(),
     hasResumeData: false,
     agentType,
-    // Copilot-only: record the launch mode at create time so a future
-    // maestro restart in a different mode can fail closed instead of
-    // silently starting fresh. In direct mode, the copilot uuid equals our
-    // id; in agency mode, agency owns the uuid and we discover it post-
-    // spawn (copilotSessionId stays undefined until then).
-    copilotLaunchMode: agentType === 'copilot' ? COPILOT_LAUNCH_MODE : undefined,
-    copilotSessionId:
-      agentType === 'copilot' && COPILOT_LAUNCH_MODE === 'direct' ? id : undefined,
+    // Strategy seeds its initial state (e.g. Copilot launch mode + uuid).
+    agentState: getStrategy(agentType).initialAgentState?.(id) ?? {},
     term: null,
     cols: body.cols ?? 120,
     rows: body.rows ?? 30,
@@ -760,9 +752,10 @@ app.post('/api/hook', async (req, res) => {
     if (outcome?.flushChat) s.reader?.poke();
   }
 
-  // PreToolUse for Claude is special — the response body carries the verdict
-  // back to claude (allow/deny). Other events get a 204 immediately.
-  if (s && s.agentType === 'claude' && event === 'PreToolUse') {
+  // PreToolUse: only agents declaring `supportsPermissionGating` participate
+  // in the chat-bridged Allow/Deny flow. Others' PreToolUse (if they have one
+  // at all) just gets a 204 like any other event.
+  if (s && getStrategy(s.agentType).supportsPermissionGating && event === 'PreToolUse') {
     const verdict = await handlePreToolUse(s, req.body ?? {});
     res.json(verdict);
     return;

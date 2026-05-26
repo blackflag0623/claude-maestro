@@ -52,7 +52,6 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { StringDecoder } from 'node:string_decoder';
 import * as pty from '@lydell/node-pty';
 import type {
   AgentReader,
@@ -63,6 +62,8 @@ import type {
 } from './index.js';
 import type { ChatMessage, SessionActivity } from '../../shared/protocol.js';
 import { debug } from '../debug.js';
+import { JsonlTail, parseJsonl } from '../jsonl-tail.js';
+import { resolveBin, type ResolvedBin } from '../bin-resolve.js';
 
 // ───────── binary resolution & launch-mode detection ─────────
 
@@ -77,44 +78,6 @@ const USER_PREFIX_ARGS = (process.env.MAESTRO_COPILOT_PREFIX_ARGS ?? '')
 const RAW_AGENCY_ENV = process.env.MAESTRO_COPILOT_AGENCY;
 const AGENCY_EXPLICITLY_ENABLED = RAW_AGENCY_ENV === '1';
 const AGENCY_EXPLICITLY_DISABLED = RAW_AGENCY_ENV === '0';
-
-interface ResolvedBin {
-  /** The path that will be passed to pty.spawn. Either the literal name (if
-   *  it contained a separator) or an absolute path discovered on PATH. If
-   *  resolution failed we still return the literal name so the spawn attempt
-   *  surfaces the user-visible error path. */
-  path: string;
-  /** True if the path was resolved from PATH (or the user supplied an
-   *  explicit path). False if we fell through with no match. */
-  found: boolean;
-  /** Directories we searched on PATH (empty for explicit paths). Used to
-   *  build a helpful spawn-failure message. */
-  searched: string[];
-}
-
-function resolveBin(name: string): ResolvedBin {
-  if (name.includes(path.sep) || name.includes('/')) {
-    return { path: name, found: fs.existsSync(name), searched: [] };
-  }
-  const exts =
-    process.platform === 'win32'
-      ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
-          .split(';')
-          .map((e) => e.toLowerCase())
-      : [''];
-  const dirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
-  for (const d of dirs) {
-    for (const ext of exts) {
-      const candidate = path.join(d, name + ext);
-      try {
-        if (fs.statSync(candidate).isFile()) {
-          return { path: candidate, found: true, searched: dirs };
-        }
-      } catch {}
-    }
-  }
-  return { path: name, found: false, searched: dirs };
-}
 
 /** Recognised launch modes. Persisted per-session as `copilotLaunchMode` so
  *  that a maestro restart in a different mode can detect the mismatch and
@@ -245,12 +208,35 @@ function eventsPathFor(sessionId: string): string {
   return path.join(COPILOT_STATE_DIR, sessionId, 'events.jsonl');
 }
 
+/** Copilot's shape inside `SpawnTarget.agentState`. */
+interface CopilotAgentState {
+  /** The agent's own session uuid. In direct mode this equals `target.id`.
+   *  In agency mode it's the agency-issued uuid, populated post-spawn after
+   *  watching `~/.copilot/session-state/`. */
+  copilotSessionId?: string;
+  /** Launch mode the session was created with. Required (we set it at
+   *  create-time). Used to fail-closed on cross-mode resumes. */
+  copilotLaunchMode?: 'direct' | 'agency';
+}
+
+function getCopilotState(target: SpawnTarget): CopilotAgentState {
+  return target.agentState as CopilotAgentState;
+}
+
+function setCopilotSessionId(target: SpawnTarget, id: string) {
+  const state = getCopilotState(target);
+  if (state.copilotSessionId === id) return;
+  state.copilotSessionId = id;
+  target.onAgentStateChange?.({ ...state });
+}
+
 /** Resolve the copilot uuid that backs a given target. In direct mode this
- *  is always `target.id`. In agency mode it's `target.copilotSessionId` once
+ *  is always `target.id`. In agency mode it's the agency-issued uuid once
  *  discovery has completed (otherwise `undefined`). */
 function resolveCopilotId(target: SpawnTarget): string | undefined {
-  if (COPILOT_LAUNCH_MODE === 'direct') return target.copilotSessionId ?? target.id;
-  return target.copilotSessionId;
+  const state = getCopilotState(target);
+  if (COPILOT_LAUNCH_MODE === 'direct') return state.copilotSessionId ?? target.id;
+  return state.copilotSessionId;
 }
 
 // ───────── agency-mode discovery ─────────
@@ -436,18 +422,14 @@ const HISTORY_WARN_BYTES = 10 * 1024 * 1024;
  *  resuming agency sessions don't replay history as live updates. Direct
  *  mode behavior is unchanged. */
 class CopilotReader implements AgentReader {
-  // Offset state for the *live* tailer. Independent of `readAll()` which
-  // does its own fresh whole-file read on every call.
-  private offset = 0;
-  private partial = '';
-  private decoder = new StringDecoder('utf8');
+  private tail: JsonlTail;
   private timer: NodeJS.Timeout | null = null;
   private cb: ReaderCallbacks | null;
   private readonly target: SpawnTarget;
   private readonly logTag: string;
-  /** Records the path against which `offset` is valid. If the path changes
-   *  mid-tail (agency discovery flips the resolution), we reset offsets and
-   *  re-run the initial scan against the new file. */
+  /** Records the path against which the tail's offset is valid. If the path
+   *  changes mid-tail (agency discovery flips the resolution), we reset the
+   *  tail and re-run the initial scan against the new file. */
   private boundPath: string | null = null;
   /** Set after a successful initial scan against `boundPath`. Reset on path
    *  change. */
@@ -457,62 +439,55 @@ class CopilotReader implements AgentReader {
     this.target = target;
     this.cb = cb;
     this.logTag = `[copilot.reader] ${target.id.slice(0, 8)}`;
+    this.tail = new JsonlTail(target.id.slice(0, 8));
 
     // Eager initial scan for direct-mode resumes (file already on disk). For
     // agency-mode new sessions the path isn't yet resolvable; the first few
-    // ticks no-op until discovery sets target.copilotSessionId, at which
-    // point tick() re-runs the initial scan against the new path.
+    // ticks no-op until discovery sets target.copilotSessionId.
     this.maybeInitialScan();
     this.startPolling();
   }
 
-  /** Current path to events.jsonl, or null if the copilot uuid is not yet
-   *  known (agency mode, pre-discovery). */
   private currentPath(): string | null {
     const sid = resolveCopilotId(this.target);
     return sid ? eventsPathFor(sid) : null;
   }
 
-  /** Initial scan logic: parse the entire existing file once, advance
-   *  `offset` to EOF, and derive activity from the last activity-bearing
-   *  event. Idempotent — only runs once per `boundPath`. Returns true if a
-   *  scan was successfully completed (or already had been). */
+  /** Parse the entire existing file once, advance offset to EOF, and derive
+   *  activity from the last activity-bearing event. Idempotent. */
   private maybeInitialScan(): boolean {
     const p = this.currentPath();
     if (!p) return false;
     if (p !== this.boundPath) {
-      // Path changed (or first resolution). Reset before scanning.
-      this.offset = 0;
-      this.partial = '';
-      this.decoder = new StringDecoder('utf8');
+      this.tail.resetForNewPath();
       this.boundPath = p;
       this.initialScanned = false;
     }
     if (this.initialScanned) return true;
+    let buf: string;
     try {
-      const buf = fs.readFileSync(p, 'utf8');
-      let last: SessionActivity | null = null;
-      for (const line of buf.split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(trimmed);
-        } catch {
-          continue;
-        }
-        const a = entryToActivity(parsed);
-        if (a) last = a;
-      }
-      this.offset = Buffer.byteLength(buf, 'utf8');
-      if (last && this.cb) this.cb.onActivity(last);
-      this.initialScanned = true;
-      debug(`${this.logTag} initial scan: offset=${this.offset}, activity=${last ?? 'none'} (${p})`);
-      return true;
+      buf = fs.readFileSync(p, 'utf8');
     } catch {
-      // File not yet written; will retry on next tick.
-      return false;
+      return false; // file not yet written; will retry on next tick.
     }
+    let last: SessionActivity | null = null;
+    for (const line of buf.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      const a = entryToActivity(parsed);
+      if (a) last = a;
+    }
+    this.tail.markConsumed(Buffer.byteLength(buf, 'utf8'));
+    if (last && this.cb) this.cb.onActivity(last);
+    this.initialScanned = true;
+    debug(`${this.logTag} initial scan complete (activity=${last ?? 'none'}, ${p})`);
+    return true;
   }
 
   readAll(): ChatMessage[] {
@@ -549,59 +524,10 @@ class CopilotReader implements AgentReader {
 
   private tick(): void {
     if (!this.cb) return;
-    // Detect path resolution / change; do initial scan when ready.
     if (!this.maybeInitialScan()) return;
     const p = this.boundPath!;
-    let st: fs.Stats;
-    try {
-      st = fs.statSync(p);
-    } catch {
-      return; // file not written yet
-    }
-    if (st.size === this.offset) return;
-    if (st.size < this.offset) {
-      debug(`${this.logTag} shrank ${this.offset}→${st.size}, restarting`);
-      this.offset = 0;
-      this.partial = '';
-      this.decoder = new StringDecoder('utf8');
-    }
-    const length = st.size - this.offset;
-    let chunk: string;
-    try {
-      const fd = fs.openSync(p, 'r');
-      try {
-        const buf = Buffer.allocUnsafe(length);
-        const read = fs.readSync(fd, buf, 0, length, this.offset);
-        chunk = this.partial + this.decoder.write(buf.slice(0, read));
-        this.offset += read;
-      } finally {
-        fs.closeSync(fd);
-      }
-    } catch (err) {
-      debug(`${this.logTag} pread failed (${(err as Error).message}), fallback`);
-      try {
-        const whole = fs.readFileSync(p, 'utf8');
-        const totalBytes = Buffer.byteLength(whole, 'utf8');
-        if (totalBytes < this.offset) {
-          this.offset = 0;
-          this.partial = '';
-        }
-        this.decoder = new StringDecoder('utf8');
-        const tail = Buffer.from(whole, 'utf8').slice(this.offset).toString('utf8');
-        chunk = this.partial + tail;
-        this.offset = totalBytes;
-      } catch (err2) {
-        debug(`${this.logTag} fallback failed: ${(err2 as Error).message}`);
-        return;
-      }
-    }
-    const lastNl = chunk.lastIndexOf('\n');
-    if (lastNl < 0) {
-      this.partial = chunk;
-      return;
-    }
-    this.partial = chunk.slice(lastNl + 1);
-    const complete = chunk.slice(0, lastNl);
+    const complete = this.tail.read(p);
+    if (!complete) return;
 
     // Walk lines, emitting chat + activity in order. We re-parse rather than
     // calling parseJsonl twice so events stay strictly ordered.
@@ -622,28 +548,42 @@ class CopilotReader implements AgentReader {
   }
 }
 
-function parseJsonl<T>(buf: string, map: (entry: unknown) => T | null): T[] {
-  const out: T[] = [];
-  for (const line of buf.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    const m = map(parsed);
-    if (m !== null) out.push(m);
-  }
-  return out;
-}
+
 
 // ───────── strategy ─────────
 
 export const copilotStrategy: AgentStrategy = {
   type: 'copilot',
   displayName: 'GitHub Copilot CLI',
+
+  initialAgentState(id: string): Record<string, unknown> {
+    // Direct mode: the copilot uuid equals our id. Agency mode: agency owns
+    // the uuid; we'll discover and persist it after the first spawn.
+    const state: CopilotAgentState = {
+      copilotLaunchMode: COPILOT_LAUNCH_MODE,
+      copilotSessionId: COPILOT_LAUNCH_MODE === 'direct' ? id : undefined,
+    };
+    return state as Record<string, unknown>;
+  },
+
+  validateAgentState(raw: Record<string, unknown>): void {
+    const state = raw as CopilotAgentState;
+    // Pre-feature records (no copilotLaunchMode field) predate the agency
+    // launch mode and so were direct-mode by definition.
+    const persistedMode = state.copilotLaunchMode ?? 'direct';
+    if (persistedMode !== COPILOT_LAUNCH_MODE) {
+      throw new Error(
+        `Copilot session was created in '${persistedMode}' launch mode, ` +
+          `but this maestro process is running in '${COPILOT_LAUNCH_MODE}' mode. ` +
+          `To resume, restart maestro with the original mode ` +
+          `(set/unset MAESTRO_COPILOT_AGENCY and MAESTRO_COPILOT_BIN accordingly). ` +
+          `To start over, delete the session and create a new one.`,
+      );
+    }
+    // Direct-mode legacy backfill: if the old record didn't carry a
+    // copilotSessionId, the uuid is the maestro id (set lazily on spawn from
+    // resolveCopilotId's fallback).
+  },
 
   spawn(target: SpawnTarget, mode: SpawnMode): pty.IPty {
     const args = buildSpawnArgs(target, mode);
@@ -663,9 +603,9 @@ export const copilotStrategy: AgentStrategy = {
     // Agency mode + new session: agency owns the uuid; we discover it after
     // spawn by watching `~/.copilot/session-state/` for a new dir. The
     // CopilotReader holds `target` by reference and re-resolves the events
-    // path on each tick, so once we set `target.copilotSessionId` and call
-    // `target.onCopilotSessionId(...)` the reader picks up automatically.
-    if (COPILOT_LAUNCH_MODE === 'agency' && !target.copilotSessionId) {
+    // path on each tick, so once we record the copilot session id on
+    // agentState the reader picks up automatically.
+    if (COPILOT_LAUNCH_MODE === 'agency' && !getCopilotState(target).copilotSessionId) {
       kickOffAgencyDiscovery(target, term);
     }
 
@@ -682,12 +622,13 @@ export const copilotStrategy: AgentStrategy = {
 // ───────── spawn helpers ─────────
 
 function buildSpawnArgs(target: SpawnTarget, mode: SpawnMode): string[] {
+  const state = getCopilotState(target);
   if (COPILOT_LAUNCH_MODE === 'agency') {
     // Agency owns the uuid for new sessions. For resume, we forward the
     // agency-issued uuid back through agency to copilot. Empirically (user-
     // verified) agency forwards `--resume=<uuid>` through.
-    if (mode === 'resume' && target.copilotSessionId) {
-      return [...COPILOT_PREFIX_ARGS, `--resume=${target.copilotSessionId}`];
+    if (mode === 'resume' && state.copilotSessionId) {
+      return [...COPILOT_PREFIX_ARGS, `--resume=${state.copilotSessionId}`];
     }
     return [...COPILOT_PREFIX_ARGS];
   }
@@ -772,12 +713,11 @@ function kickOffAgencyDiscovery(target: SpawnTarget, term: pty.IPty): void {
       `[copilot.agency] discovered session=${target.id.slice(0, 8)} → ` +
         `copilotSessionId=${result.copilotSessionId}`,
     );
-    target.copilotSessionId = result.copilotSessionId;
     try {
-      target.onCopilotSessionId?.(result.copilotSessionId);
+      setCopilotSessionId(target, result.copilotSessionId);
     } catch (err) {
       console.error(
-        `[maestro] onCopilotSessionId callback threw for session ${target.id}: ${
+        `[maestro] persist copilot session id failed for ${target.id}: ${
           (err as Error).message
         }`,
       );

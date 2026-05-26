@@ -21,33 +21,13 @@ import type {
 import type { ChatMessage, SessionActivity } from '../../shared/protocol.js';
 import { TranscriptReader } from '../transcript-reader.js';
 import { debug } from '../debug.js';
+import { resolveBin } from '../bin-resolve.js';
 
 const STORE_DIR =
   process.env.MAESTRO_STORE_DIR ?? path.join(os.homedir(), '.claude-maestro');
 
 const CLAUDE_BIN_RAW = process.env.MAESTRO_CLAUDE_BIN ?? 'claude';
-
-function resolveBin(name: string): string {
-  if (name.includes(path.sep) || name.includes('/')) return name;
-  const exts =
-    process.platform === 'win32'
-      ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
-          .split(';')
-          .map((e) => e.toLowerCase())
-      : [''];
-  const dirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
-  for (const d of dirs) {
-    for (const ext of exts) {
-      const candidate = path.join(d, name + ext);
-      try {
-        if (fs.statSync(candidate).isFile()) return candidate;
-      } catch {}
-    }
-  }
-  return name;
-}
-
-const CLAUDE_BIN = resolveBin(CLAUDE_BIN_RAW);
+const CLAUDE_BIN = resolveBin(CLAUDE_BIN_RAW).path;
 
 // ───────── hook files (Claude-specific) ─────────
 
@@ -220,6 +200,7 @@ class ClaudeReader implements AgentReader {
 export const claudeStrategy: AgentStrategy = {
   type: 'claude',
   displayName: 'Claude Code',
+  supportsPermissionGating: true,
 
   spawn(target: SpawnTarget, mode: SpawnMode): pty.IPty {
     const baseArgs =
