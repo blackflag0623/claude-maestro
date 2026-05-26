@@ -40,6 +40,22 @@ export class ScrollbackBuffer {
     return joined;
   }
 
+  /** Replace buffer contents with `data`, capped at `limit` chars. Used on
+   *  boot to restore an on-disk scrollback file before any subscriber
+   *  attaches. Both the chunk array and the running byte total must be
+   *  rewritten — forgetting `bytes` would silently break the trim invariant
+   *  the very next time `append()` runs. */
+  hydrate(data: string): void {
+    if (!data) {
+      this.chunks = [];
+      this.bytes = 0;
+      return;
+    }
+    const trimmed = data.length > this.limit ? data.slice(-this.limit) : data;
+    this.chunks = [trimmed];
+    this.bytes = trimmed.length;
+  }
+
   get length(): number {
     return this.bytes;
   }

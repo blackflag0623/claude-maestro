@@ -20,11 +20,17 @@ Tracks known limitations, upstream quirks, and platform restrictions affecting c
 
 ## Server (node-pty / shell auto-launch)
 
-### Scrollback (terminal output) is lost on maestro restart
+### Persisted scrollback is cached on disk (privacy implication)
 
-- **Symptom:** After restarting `npm run dev` (server side), reattaching to a previously-running node shows an empty terminal — `claude` is rehydrated mid-conversation but the visual scrollback before the restart is gone.
-- **Root cause:** Scrollback is the rendered ANSI byte stream from xterm; it lives in maestro's process memory (256 KB ring per session) and is not persisted. The Claude *conversation* itself is rebuilt by `claude --resume <uuid>` from its on-disk JSONL, but xterm has nothing to replay against.
-- **Workaround:** None within maestro. The conversation history is preserved — just scroll up inside the rehydrated Claude TUI to see prior turns.
+- **Symptom:** Maestro mirrors each session's PTY byte stream to `~/.claude-maestro/scrollback/<uuid>.bin` (raw UTF-8, ANSI escapes preserved) so the visual buffer survives maestro restart. On shared hosts these files are readable by anything running as the same user and may contain tokens pasted into the terminal, file paths, command output, etc.
+- **Root cause:** Without an on-disk cache, scrollback is recreated only by `claude --resume` / Copilot's reader replaying the structured transcript — which loses the visual buffer (TUI redraws, colors, tool-call rendering) the user actually saw before the restart.
+- **Workaround:** Set `MAESTRO_DISABLE_SCROLLBACK_PERSIST=1` before starting maestro to keep scrollback in memory only. Files for killed sessions are removed automatically; files for sessions explicitly deleted via `DELETE /api/sessions/:id` are also removed. The `~/.claude-maestro/scrollback/` directory can be safely wiped at any time — only the visual buffer is affected, not the agent's conversation.
+
+### Scrollback ring may overshoot 256 KB for a single oversized chunk
+
+- **Symptom:** If a single PTY write exceeds 256 KB (e.g. a large image escape sequence emitted by an agent that supports sixel / iTerm graphics), `ScrollbackBuffer` keeps it as-is rather than slicing it, so the effective buffer can briefly hold more than the configured limit.
+- **Root cause:** The trim loop drops oldest chunks until one is left; slicing the survivor on every write would re-allocate and defeat the chunk-array design.
+- **Workaround:** None needed in practice — typical PTY chunks are <1 KB. If an agent starts emitting hundreds of KB per write, lower its image-output verbosity or strip image escapes upstream.
 
 ---
 

@@ -32,6 +32,13 @@ const STORE_DIR =
   process.env.MAESTRO_STORE_DIR ??
   path.join(os.homedir(), '.claude-maestro');
 const STORE_FILE = path.join(STORE_DIR, 'sessions.json');
+const SCROLLBACK_DIR = path.join(STORE_DIR, 'scrollback');
+const SCROLLBACK_FLUSH_DEBOUNCE_MS = 2_000;
+/** Opt-out for users who don't want PTY bytes (which may include tokens,
+ *  paths, etc.) cached on disk across maestro restarts. When set, the
+ *  server falls back to the original in-memory-only behavior. */
+const SCROLLBACK_PERSIST_ENABLED =
+  process.env.MAESTRO_DISABLE_SCROLLBACK_PERSIST !== '1';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Read package.json once at startup. We walk up from this file because the
@@ -121,6 +128,8 @@ function loadPersisted() {
       console.warn(`[maestro] skipping session ${p.id} with unknown agentType: ${String(at)}`);
       continue;
     }
+    const scrollback = new ScrollbackBuffer(SCROLLBACK_BYTES);
+    loadScrollback(p.id, scrollback);
     sessions.set(p.id, {
       id: p.id,
       title: p.title ?? `node-${p.id.slice(0, 4)}`,
@@ -133,7 +142,7 @@ function loadPersisted() {
       rows: 30,
       alive: false,
       exitCode: null,
-      scrollback: new ScrollbackBuffer(SCROLLBACK_BYTES),
+      scrollback,
       subscribers: new Set(),
       chatSubscribers: new Set(),
       reader: null,
@@ -141,6 +150,94 @@ function loadPersisted() {
     });
   }
   debug(`[maestro] restored ${sessions.size} dormant session(s) from ${STORE_FILE}`);
+}
+
+// ───────── scrollback persistence ─────────
+//
+// PTY output for each session is mirrored to ~/.claude-maestro/scrollback/<id>.bin
+// (raw UTF-8 with ANSI escapes preserved) so the visual buffer survives a
+// maestro restart, not just the underlying agent conversation. Writes are
+// debounced ~2s and use the rename-over-temp pattern so a crash mid-write
+// never leaves a half-written file. On boot, hydrate(...) replaces the
+// session's in-memory ring before any client can attach.
+//
+// Privacy: this is a behavior change — see KNOWN_ISSUES.md. Users on shared
+// machines can disable via MAESTRO_DISABLE_SCROLLBACK_PERSIST=1.
+
+const pendingScrollbackFlush = new Map<string, NodeJS.Timeout>();
+
+function scrollbackPathFor(id: string): string {
+  return path.join(SCROLLBACK_DIR, `${id}.bin`);
+}
+
+function loadScrollback(id: string, buf: ScrollbackBuffer) {
+  if (!SCROLLBACK_PERSIST_ENABLED) return;
+  const p = scrollbackPathFor(id);
+  try {
+    if (!fs.existsSync(p)) return;
+    const data = fs.readFileSync(p, 'utf8');
+    buf.hydrate(data);
+  } catch (err) {
+    // Corrupt / unreadable file shouldn't block boot — just log and move on.
+    console.warn(`[maestro] failed to read scrollback for ${id}:`, (err as Error).message);
+  }
+}
+
+function flushScrollback(s: Session) {
+  if (!SCROLLBACK_PERSIST_ENABLED) return;
+  const dst = scrollbackPathFor(s.id);
+  const tmp = `${dst}.tmp`;
+  try {
+    fs.mkdirSync(SCROLLBACK_DIR, { recursive: true });
+    fs.writeFileSync(tmp, s.scrollback.read(), 'utf8');
+    fs.renameSync(tmp, dst);
+  } catch (err) {
+    console.warn(`[maestro] failed to flush scrollback for ${s.id}:`, (err as Error).message);
+    try {
+      fs.unlinkSync(tmp);
+    } catch {}
+  }
+}
+
+function scheduleScrollbackFlush(s: Session) {
+  if (!SCROLLBACK_PERSIST_ENABLED) return;
+  const existing = pendingScrollbackFlush.get(s.id);
+  if (existing) clearTimeout(existing);
+  const t = setTimeout(() => {
+    pendingScrollbackFlush.delete(s.id);
+    flushScrollback(s);
+  }, SCROLLBACK_FLUSH_DEBOUNCE_MS);
+  // Don't keep the Node process alive just because a debounce window is
+  // open — the SIGINT/SIGTERM handlers will flush synchronously on exit.
+  t.unref();
+  pendingScrollbackFlush.set(s.id, t);
+}
+
+function deleteScrollback(id: string) {
+  const pending = pendingScrollbackFlush.get(id);
+  if (pending) {
+    clearTimeout(pending);
+    pendingScrollbackFlush.delete(id);
+  }
+  if (!SCROLLBACK_PERSIST_ENABLED) return;
+  try {
+    fs.unlinkSync(scrollbackPathFor(id));
+  } catch {
+    // File may not exist (session created and killed before any flush).
+  }
+}
+
+/** Synchronously flush every pending scrollback file. Called from the
+ *  SIGINT / SIGTERM / beforeExit handlers — must not be async because Node
+ *  won't await a signal handler before exiting. */
+function flushAllScrollbackSync() {
+  if (!SCROLLBACK_PERSIST_ENABLED) return;
+  for (const [id, timer] of pendingScrollbackFlush) {
+    clearTimeout(timer);
+    const s = sessions.get(id);
+    if (s) flushScrollback(s);
+  }
+  pendingScrollbackFlush.clear();
 }
 
 // ───────── helpers ─────────
@@ -162,6 +259,7 @@ function toInfo(s: Session): SessionInfo {
 
 function appendScrollback(s: Session, data: string) {
   s.scrollback.append(data);
+  scheduleScrollbackFlush(s);
 }
 
 function broadcast(s: Session, msg: ServerMessage) {
@@ -390,6 +488,7 @@ function killSession(id: string): boolean {
   }
   sessions.delete(id);
   persist();
+  deleteScrollback(id);
   // Note: leaves the agent's on-disk transcript intact (Claude's
   // ~/.claude/projects/<slug>/<uuid>.jsonl or Copilot's
   // ~/.copilot/session-state/<uuid>/events.jsonl) so the user can still
@@ -877,8 +976,36 @@ function attach(ws: WebSocket, sessionId: string) {
 loadPersisted();
 initAgentEnvironments();
 
+// Flush any debounced scrollback to disk before the process actually exits.
+// Signal handlers MUST stay synchronous — Node does not await async work in
+// SIGINT/SIGTERM listeners before terminating, and any I/O queued after the
+// listener returns is lost. After flushing we re-raise the exit so we don't
+// silently swallow Ctrl+C.
+let exiting = false;
+function gracefulExit(signal: NodeJS.Signals | 'beforeExit', code = 0) {
+  if (exiting) return;
+  exiting = true;
+  try {
+    flushAllScrollbackSync();
+  } catch (err) {
+    console.error('[maestro] scrollback flush failed during exit:', (err as Error).message);
+  }
+  if (signal !== 'beforeExit') {
+    // Default Node action for SIGINT is exit(130); preserve conventional codes.
+    process.exit(signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : code);
+  }
+}
+process.on('SIGINT', () => gracefulExit('SIGINT'));
+process.on('SIGTERM', () => gracefulExit('SIGTERM'));
+process.on('beforeExit', (code) => gracefulExit('beforeExit', code));
+
 server.listen(PORT, () => {
   // Startup banner is intentionally unguarded — operators need to see it.
   console.log(`[maestro] v${PKG_VERSION} http + ws on http://127.0.0.1:${PORT}`);
   console.log(`[maestro] store: ${STORE_FILE}`);
+  if (SCROLLBACK_PERSIST_ENABLED) {
+    console.log(`[maestro] scrollback: ${SCROLLBACK_DIR}`);
+  } else {
+    console.log(`[maestro] scrollback persistence disabled (MAESTRO_DISABLE_SCROLLBACK_PERSIST=1)`);
+  }
 });

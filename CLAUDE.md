@@ -168,8 +168,8 @@ versa). Adding a new shared module is preferred over duplicating utilities.
 - **Sessions persist across maestro restart** via `~/.claude-maestro/sessions.json` (the registry) plus the agent's own transcript file (Claude: `~/.claude/projects/<slug>/<uuid>.jsonl`; Copilot: `~/.copilot/session-state/<uuid>/events.jsonl`). After a maestro restart, sessions appear in the API as `attached: false` (dormant) until a client attaches and triggers `<agent> --resume <uuid>`.
 - **Persistence migration:** registry entries written before the agent abstraction (no `agentType` field) are loaded as `'claude'`. Entries with an unknown `agentType` value are quarantined with a warning and skipped at load — they remain on disk for forensic inspection but do not appear in the API.
 - **Closing/reloading the browser does not affect sessions.** Removing a server from the portal does not kill its sessions.
-- **Killing a node** (`DELETE /api/sessions/:id`) removes the session from the registry. The underlying transcript file is left on disk for manual recovery via `<agent> --resume <uuid>` from a shell.
-- **Scrollback (terminal pixels) is lost on maestro restart.** The conversation (the agent's history of messages and tool calls) is not.
+- **Killing a node** (`DELETE /api/sessions/:id`) removes the session from the registry and deletes its scrollback file. The underlying agent transcript file is left on disk for manual recovery via `<agent> --resume <uuid>` from a shell.
+- **Scrollback (the rendered ANSI byte stream) persists across maestro restart** via `~/.claude-maestro/scrollback/<uuid>.bin` — debounced ~2s on every PTY write, flushed synchronously on SIGINT/SIGTERM/beforeExit. Set `MAESTRO_DISABLE_SCROLLBACK_PERSIST=1` to keep scrollback in-memory only (privacy / shared-host scenarios — see `KNOWN_ISSUES.md`).
 
 ## Working style
 
