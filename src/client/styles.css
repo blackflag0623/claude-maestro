@@ -748,6 +748,47 @@ button { font: inherit; color: inherit; }
   opacity: 0.06;
 }
 
+/* Jump-to-bottom pill. Pinned bottom-right of the terminal pane, offset
+   left of the xterm scrollbar (matches the cursor-indicator offset). Hidden
+   while the viewport is at the bottom. When fresh lines have arrived since
+   the user scrolled away, the pill flips to the lime accent + shows a count. */
+.jump-to-bottom {
+  position: absolute;
+  bottom: 12px;
+  right: 22px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  appearance: none;
+  background: var(--bone);
+  color: var(--ink);
+  border: 2px solid var(--ink);
+  box-shadow: 3px 3px 0 0 var(--ink);
+  padding: 4px 8px;
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.jump-to-bottom[hidden] { display: none; }
+.jump-to-bottom:hover {
+  background: color-mix(in srgb, var(--ink) 8%, var(--bone));
+}
+.jump-to-bottom:active {
+  transform: translate(1px, 1px);
+  box-shadow: 2px 2px 0 0 var(--ink);
+}
+.jump-to-bottom[data-fresh="true"] {
+  background: var(--lime);
+}
+.jump-to-bottom__arrow {
+  font-size: 13px;
+  line-height: 1;
+}
+.jump-to-bottom__count:empty { display: none; }
+
 /* Find-in-node overlay. Pinned top-right inside the terminal pane, offset
    left of the chase indicator. Brutalist vocabulary: bone-on-ink panel,
    2px black rule, mono input. Lime focus accent. */

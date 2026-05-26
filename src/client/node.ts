@@ -45,6 +45,11 @@ export class TerminalNode {
   private _activity: SessionActivity = 'unknown';
   private lastPasteAt = 0;
   private readonly indicator: CursorIndicator;
+  private readonly jumpPill: HTMLButtonElement;
+  private jumpPillCount: HTMLSpanElement;
+  private replayingScrollback = false;
+  private newLinesWhileAway = 0;
+  private prevBaseY = 0;
   session: SessionInfo | null = null;
 
   constructor(
@@ -120,6 +125,40 @@ export class TerminalNode {
     this.el.appendChild(this.indicator.el);
     this.searchOverlay = buildSearchOverlay(this.search);
     this.el.appendChild(this.searchOverlay.el);
+
+    // Jump-to-bottom pill. Pinned bottom-right of the terminal pane, offset
+    // left of the xterm scrollbar (the cursor-indicator uses the same offset
+    // pattern). Hidden when the viewport is already at the bottom of the
+    // buffer. While scrolled away from the bottom, accumulates a count of
+    // newly-arrived scrollback lines so the user knows there is fresh
+    // output waiting below.
+    this.jumpPill = document.createElement('button');
+    this.jumpPill.type = 'button';
+    this.jumpPill.className = 'jump-to-bottom';
+    this.jumpPill.hidden = true;
+    this.jumpPill.setAttribute('aria-label', 'jump to bottom');
+    this.jumpPill.title = 'jump to bottom';
+    const arrow = document.createElement('span');
+    arrow.className = 'jump-to-bottom__arrow';
+    arrow.textContent = '↓';
+    this.jumpPillCount = document.createElement('span');
+    this.jumpPillCount.className = 'jump-to-bottom__count';
+    this.jumpPill.appendChild(arrow);
+    this.jumpPill.appendChild(this.jumpPillCount);
+    this.jumpPill.addEventListener('click', () => {
+      this.term.scrollToBottom();
+      this.newLinesWhileAway = 0;
+      this.updateJumpPill();
+      this.term.focus();
+    });
+    this.el.appendChild(this.jumpPill);
+
+    // onScroll fires for both user-driven scroll and buffer growth. We use
+    // the delta in `buffer.active.baseY` to detect new content (lines pushed
+    // into scrollback) and `viewportY >= baseY` to detect "at bottom". When
+    // the user is scrolled away and new lines arrive, we accumulate a
+    // counter; when they jump back to the bottom we reset.
+    this.term.onScroll(() => this.onScroll());
 
     // All paste paths funnel through pasteText() which wraps content in
     // bracketed-paste markers. Keyboard and DOM entry points coordinate
@@ -303,6 +342,9 @@ ${body}
       // Clear local view so replayed scrollback isn't doubled with what was
       // already on screen from before disconnect.
       this.term.reset();
+      this.prevBaseY = 0;
+      this.newLinesWhileAway = 0;
+      this.updateJumpPill();
       this.send({ type: 'attach', cols: this.term.cols, rows: this.term.rows });
     };
 
@@ -315,7 +357,18 @@ ${body}
       }
       if (msg.type === 'attached') {
         this.session = msg.session;
-        if (msg.scrollback) this.term.write(msg.scrollback);
+        if (msg.scrollback) {
+          // Suppress the jump-pill new-line counter while we replay the
+          // server's scrollback ring — otherwise every reconnect would
+          // show "N new lines" for content the user has already seen.
+          this.replayingScrollback = true;
+          this.term.write(msg.scrollback, () => {
+            this.replayingScrollback = false;
+            this.prevBaseY = this.term.buffer.active.baseY;
+            this.newLinesWhileAway = 0;
+            this.updateJumpPill();
+          });
+        }
         this.setStatus(msg.session.alive ? 'live' : 'exited');
         this.setActivity(msg.session.activity ?? 'unknown');
         this.events.title?.(msg.session.title);
@@ -355,6 +408,43 @@ ${body}
       this.connect();
     }, this.reconnectDelay);
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, 5000);
+  }
+
+  /** Recompute jump-pill visibility + delta count off the current buffer.
+   *  Called from xterm's onScroll (which covers both user scroll and buffer
+   *  growth) plus a few explicit reset points (reconnect, click). */
+  private onScroll() {
+    const buf = this.term.buffer.active;
+    const baseY = buf.baseY;
+    const viewportY = buf.viewportY;
+    const atBottom = viewportY >= baseY;
+    const grew = baseY - this.prevBaseY;
+    this.prevBaseY = baseY;
+    if (!this.replayingScrollback && !atBottom && grew > 0) {
+      // Cap to avoid the counter ballooning if a massive paste comes in.
+      this.newLinesWhileAway = Math.min(this.newLinesWhileAway + grew, 9999);
+    }
+    if (atBottom) this.newLinesWhileAway = 0;
+    this.updateJumpPill();
+  }
+
+  private updateJumpPill() {
+    const buf = this.term.buffer.active;
+    const atBottom = buf.viewportY >= buf.baseY;
+    if (atBottom) {
+      this.jumpPill.hidden = true;
+      this.jumpPillCount.textContent = '';
+      return;
+    }
+    this.jumpPill.hidden = false;
+    if (this.newLinesWhileAway > 0) {
+      this.jumpPillCount.textContent =
+        this.newLinesWhileAway >= 9999 ? '9999+' : String(this.newLinesWhileAway);
+      this.jumpPill.dataset.fresh = 'true';
+    } else {
+      this.jumpPillCount.textContent = '';
+      delete this.jumpPill.dataset.fresh;
+    }
   }
 }
 
