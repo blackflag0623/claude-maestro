@@ -48,8 +48,24 @@ const COPILOT_PREFIX_ARGS = (process.env.MAESTRO_COPILOT_PREFIX_ARGS ?? '')
   .split(/\s+/)
   .filter(Boolean);
 
-function resolveBin(name: string): string {
-  if (name.includes(path.sep) || name.includes('/')) return name;
+interface ResolvedBin {
+  /** The path that will be passed to pty.spawn. Either the literal name (if
+   *  it contained a separator) or an absolute path discovered on PATH. If
+   *  resolution failed we still return the literal name so the spawn attempt
+   *  surfaces the user-visible error path. */
+  path: string;
+  /** True if the path was resolved from PATH (or the user supplied an
+   *  explicit path). False if we fell through with no match. */
+  found: boolean;
+  /** Directories we searched on PATH (empty for explicit paths). Used to
+   *  build a helpful spawn-failure message. */
+  searched: string[];
+}
+
+function resolveBin(name: string): ResolvedBin {
+  if (name.includes(path.sep) || name.includes('/')) {
+    return { path: name, found: fs.existsSync(name), searched: [] };
+  }
   const exts =
     process.platform === 'win32'
       ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
@@ -61,14 +77,30 @@ function resolveBin(name: string): string {
     for (const ext of exts) {
       const candidate = path.join(d, name + ext);
       try {
-        if (fs.statSync(candidate).isFile()) return candidate;
+        if (fs.statSync(candidate).isFile()) {
+          return { path: candidate, found: true, searched: dirs };
+        }
       } catch {}
     }
   }
-  return name;
+  return { path: name, found: false, searched: dirs };
 }
 
-const COPILOT_BIN = resolveBin(COPILOT_BIN_RAW);
+const COPILOT_BIN_INFO = resolveBin(COPILOT_BIN_RAW);
+const COPILOT_BIN = COPILOT_BIN_INFO.path;
+
+if (!COPILOT_BIN_INFO.found) {
+  // Surface immediately at startup so the operator sees it before the first
+  // user attempts a Copilot session and hits the (less helpful) spawn-time
+  // failure on the wire.
+  console.warn(
+    `[maestro] WARNING: Copilot CLI binary "${COPILOT_BIN_RAW}" not found on PATH. ` +
+      `Copilot sessions will fail to spawn until either (a) "${COPILOT_BIN_RAW}" is installed and on PATH ` +
+      `for the maestro server process, or (b) MAESTRO_COPILOT_BIN is set to an absolute path to the executable. ` +
+      `Install hint: \`npm install -g @github/copilot\` (then ensure the npm global bin dir is on PATH), ` +
+      `or on Windows install via WinGet (\`winget install GitHub.Copilot\`).`,
+  );
+}
 
 // ───────── events.jsonl helpers ─────────
 
@@ -343,7 +375,28 @@ export const copilotStrategy: AgentStrategy = {
         env: { ...process.env, MAESTRO_SESSION: target.id } as Record<string, string>,
       });
     } catch (err) {
-      const message = `failed to spawn ${COPILOT_BIN}: ${(err as Error).message}`;
+      const inner = (err as Error).message || String(err);
+      const parts = [
+        `failed to spawn Copilot CLI: ${inner}`,
+        `  attempted binary: ${COPILOT_BIN}`,
+      ];
+      if (COPILOT_BIN_RAW !== COPILOT_BIN) {
+        parts.push(`  configured name:  ${COPILOT_BIN_RAW}`);
+      }
+      if (!COPILOT_BIN_INFO.found) {
+        parts.push(
+          `  resolution:       NOT FOUND on PATH at server startup`,
+          `  fix:              install Copilot CLI on this host (e.g. \`npm install -g @github/copilot\` or \`winget install GitHub.Copilot\`),`,
+          `                    or set MAESTRO_COPILOT_BIN to an absolute path to the executable, then restart maestro.`,
+        );
+      } else {
+        parts.push(
+          `  resolution:       found on PATH`,
+          `  hint:             if this is a wrapper script or symlink that node-pty can't execute,`,
+          `                    set MAESTRO_COPILOT_BIN to the real target binary and restart maestro.`,
+        );
+      }
+      const message = parts.join('\n');
       console.error(`[maestro] ${message}`);
       throw new Error(message);
     }
