@@ -6,9 +6,9 @@
 //   DELETE /api/sessions/:id          -> { ok: true }
 //
 // WebSocket endpoint:
-//   GET /maestro-ws?sessionId=<id>    upgrades; client must send {type:'attach'}
-//                                     before any input. On attach the server replays
-//                                     the scrollback buffer, then streams live output.
+//   GET /maestro-ws?sessionId=<id>    upgrades; client sends `attach` (terminal)
+//                                     or `attachChat` (mobile) as its first frame.
+//                                     See ClientMessage / ServerMessage below.
 
 export type SessionActivity = 'unknown' | 'working' | 'waiting' | 'idle';
 

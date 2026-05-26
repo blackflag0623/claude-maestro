@@ -1,15 +1,11 @@
-// Claude Code strategy. Extracted verbatim from the original monolithic
-// `index.ts` — the spawn args, hook script, settings layout, and bin lookup
-// rules are unchanged. Only the call surface has been reshaped to fit
-// `AgentStrategy`.
+// Claude Code agent strategy.
 //
-// What's Claude-specific here:
-//   - `claude --session-id <uuid>` / `claude --resume <uuid>` invocation.
-//   - A hook system: claude POSTs to `/api/hook` on PreToolUse / Stop / etc.
-//     We write a tiny Node-only hook script (`hook.mjs`) plus a settings
-//     file (`hooks.json`) and pass `--settings hooks.json` to claude.
-//   - The transcript reader (`TranscriptReader`) parses Claude's own
-//     `~/.claude/projects/<slug>/<uuid>.jsonl` files.
+// Claude-specific contracts:
+//   - Spawn: `claude --session-id <uuid>` for new, `claude --resume <uuid>` for resume.
+//   - Hooks: claude POSTs to `/api/hook` on PreToolUse / Stop / etc. We write a
+//     Node hook script (`hook.mjs`) plus a settings file (`hooks.json`) and
+//     pass `--settings hooks.json` to claude.
+//   - Transcript: `TranscriptReader` parses `~/.claude/projects/<slug>/<uuid>.jsonl`.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -26,8 +22,6 @@ import type { ChatMessage, SessionActivity } from '../../shared/protocol.js';
 import { TranscriptReader } from '../transcript-reader.js';
 import { debug } from '../debug.js';
 
-// Shared resolution rules with index.ts (kept in sync; both read env directly).
-const PORT = Number(process.env.PORT ?? 4050);
 const STORE_DIR =
   process.env.MAESTRO_STORE_DIR ?? path.join(os.homedir(), '.claude-maestro');
 
@@ -59,7 +53,6 @@ const CLAUDE_BIN = resolveBin(CLAUDE_BIN_RAW);
 
 const HOOK_SCRIPT = path.join(STORE_DIR, 'hook.mjs');
 const HOOK_SETTINGS = path.join(STORE_DIR, 'hooks.json');
-const HOOK_URL = `http://127.0.0.1:${PORT}/api/hook`;
 const NODE_BIN = process.execPath;
 
 const HOOK_ACTIVITY = {
@@ -86,9 +79,10 @@ function writeIfChanged(filePath: string, contents: string): boolean {
   return true;
 }
 
-export function ensureClaudeHookFiles(): void {
+export function ensureClaudeHookFiles(port: number): void {
   try {
     fs.mkdirSync(STORE_DIR, { recursive: true });
+    const hookUrl = `http://127.0.0.1:${port}/api/hook`;
     // Cross-platform hook script. Two paths:
     //   PreToolUse  — blocks on maestro for a verdict (up to ~65s), then
     //                 writes Claude's expected hookSpecificOutput JSON to
@@ -101,7 +95,7 @@ const isBlocking = event === 'PreToolUse';
 let body = '';
 process.stdin.on('data', (c) => { body += c; });
 process.stdin.on('end', () => {
-  const req = http.request(${JSON.stringify(HOOK_URL)}, {
+  const req = http.request(${JSON.stringify(hookUrl)}, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',

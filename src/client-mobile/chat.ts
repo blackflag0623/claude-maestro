@@ -9,17 +9,14 @@ import type {
 import { ASK_UQ_ANSWER_PREFIX } from '../shared/protocol';
 import { MaestroApi } from '../client-shared/api';
 import { debug } from '../client-shared/debug';
+import { escapeHtml } from '../client-shared/html';
+import { agentShort } from '../client-shared/agent-labels';
 import type { MobileServerEntry } from './mobile-state';
 
-// `marked` and `DOMPurify` are loaded as UMD globals from CDN in index.html.
-// Pulling them via `import` triggers Vite's optimize-deps pipeline, which has
-// been racing against itself on this setup and serving stale 504s. Using the
-// CDN globals removes Vite from that path entirely.
-//
 // SECURITY: marked's output is HTML that may contain script tags or `on*`
-// attributes if Claude's transcript ever contained crafted text (e.g. a
-// prompt-injection from a file Claude was asked to summarize). Always pipe
-// marked output through DOMPurify before assigning to innerHTML.
+// attributes if a transcript ever contained crafted text (e.g. a prompt-
+// injection from a file Claude was asked to summarize). Always pipe marked
+// output through DOMPurify before assigning to innerHTML.
 declare const marked: {
   parse: (s: string) => string;
   setOptions: (o: { gfm?: boolean; breaks?: boolean }) => void;
@@ -31,21 +28,15 @@ declare const DOMPurify: {
 if (typeof marked !== 'undefined') {
   marked.setOptions({ gfm: true, breaks: true });
 } else {
-  console.warn('[chat] marked global missing — bubbles will fall back to plain text');
+  debug('[chat] marked global missing — bubbles will fall back to plain text');
 }
 if (typeof DOMPurify === 'undefined') {
-  console.warn('[chat] DOMPurify global missing — markdown will be rendered as escaped plain text for safety');
+  debug('[chat] DOMPurify global missing — markdown will be rendered as escaped plain text for safety');
 }
 
 function renderMarkdown(text: string): string {
-  // Always-safe fallback: HTML-escape and preserve newlines. Used when either
-  // CDN script failed to load.
-  const plain = () =>
-    text
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/\n/g, '<br>');
+  // Always-safe fallback when either CDN script failed to load.
+  const plain = () => escapeHtml(text).replace(/\n/g, '<br>');
 
   if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
     return plain();
@@ -118,8 +109,7 @@ export function renderChat(
   let attached = false;
   let agentType: AgentType = 'claude';
 
-  const agentDisplay = (a: AgentType) => (a === 'copilot' ? 'Copilot' : 'Claude');
-  const workingMsg = () => `${agentDisplay(agentType)} is working…`;
+  const workingMsg = () => `${agentShort(agentType)} is working…`;
 
   function setStatus(text: string) {
     statusEl.textContent = text;
@@ -197,14 +187,6 @@ export function renderChat(
   // bubble in-place instead of stacking another.
   const toolBubbles = new Map<string, HTMLElement>();
 
-  function escapeHtml(s: string): string {
-    return s
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
   function formatToolInput(input: unknown): string {
     if (input === null || input === undefined) return '';
     if (typeof input === 'string') return input;
@@ -477,7 +459,7 @@ export function renderChat(
       try {
         msg = JSON.parse(ev.data as string);
       } catch {
-        console.warn('[chat] bad frame', ev.data);
+        debug('[chat] bad frame', ev.data);
         return;
       }
       debug('[chat] <-', msg.type, msg);
@@ -494,7 +476,7 @@ export function renderChat(
       lockInput('disconnected — reload to retry');
     });
     ws.addEventListener('error', (ev) => {
-      console.error('[chat] ws error', ev);
+      debug('[chat] ws error', ev);
       setStatus('error');
     });
   }
@@ -590,7 +572,7 @@ export function renderChat(
           open this session from the desktop terminal portal to interact with
           it directly.
         </p>
-        <p class="hint">server said: ${msg.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</p>
+        <p class="hint">server said: ${escapeHtml(msg)}</p>
       </main>
     `;
     root.querySelector<HTMLButtonElement>('#back')!.addEventListener('click', () => cb.onBack());

@@ -218,15 +218,9 @@ function loadPersisted() {
 
 // ───────── scrollback persistence ─────────
 //
-// PTY output for each session is mirrored to ~/.claude-maestro/scrollback/<id>.bin
-// (raw UTF-8 with ANSI escapes preserved) so the visual buffer survives a
-// maestro restart, not just the underlying agent conversation. Writes are
-// debounced ~2s and use the rename-over-temp pattern so a crash mid-write
-// never leaves a half-written file. On boot, hydrate(...) replaces the
-// session's in-memory ring before any client can attach.
-//
-// Privacy: this is a behavior change — see KNOWN_ISSUES.md. Users on shared
-// machines can disable via MAESTRO_DISABLE_SCROLLBACK_PERSIST=1.
+// PTY bytes mirrored to ~/.claude-maestro/scrollback/<id>.bin so the visual
+// buffer survives maestro restart. Writes debounce ~2s and use rename-over-
+// temp. Disable via MAESTRO_DISABLE_SCROLLBACK_PERSIST=1 (see KNOWN_ISSUES.md).
 
 const pendingScrollbackFlush = new Map<string, NodeJS.Timeout>();
 
@@ -800,28 +794,14 @@ async function handlePreToolUse(
   const forcePause = isAskUQ && s.chatSubscribers.size > 0;
 
   if (mode === 'auto' && !forcePause) {
-    if (s.chatSubscribers.size > 0) {
-      broadcastToolCall(s, {
-        type: 'tool_call',
-        toolCallId,
-        toolName,
-        toolInput,
-        status: 'allowed',
-        ts,
-      });
-    } else {
-      // No subscriber: remember the bubble so a later chat attach replays it.
-      const bubble: Extract<ChatMessage, { type: 'tool_call' }> = {
-        type: 'tool_call',
-        toolCallId,
-        toolName,
-        toolInput,
-        status: 'allowed',
-        ts,
-      };
-      s.syntheticBubbles.set(toolCallId, bubble);
-      appendBubble(s.id, bubble);
-    }
+    broadcastToolCall(s, {
+      type: 'tool_call',
+      toolCallId,
+      toolName,
+      toolInput,
+      status: 'allowed',
+      ts,
+    });
     return { decision: 'allow' };
   }
 
@@ -1285,7 +1265,6 @@ function attach(ws: WebSocket, sessionId: string) {
 }
 
 loadPersisted();
-initAgentEnvironments();
 
 // Flush any debounced scrollback to disk before the process actually exits.
 // Signal handlers MUST stay synchronous — Node does not await async work in
@@ -1311,8 +1290,13 @@ process.on('SIGTERM', () => gracefulExit('SIGTERM'));
 process.on('beforeExit', (code) => gracefulExit('beforeExit', code));
 
 server.listen(PORT, () => {
+  const addr = server.address();
+  const boundPort = typeof addr === 'object' && addr ? addr.port : PORT;
+  // Init agent helpers AFTER bind so the port baked into Claude's hook URL
+  // matches what was actually claimed (PORT=0 → kernel-chosen port works).
+  initAgentEnvironments(boundPort);
   // Startup banner is intentionally unguarded — operators need to see it.
-  console.log(`[maestro] v${PKG_VERSION} http + ws on http://127.0.0.1:${PORT}`);
+  console.log(`[maestro] v${PKG_VERSION} http + ws on http://127.0.0.1:${boundPort}`);
   console.log(`[maestro] store: ${STORE_FILE}`);
   if (SCROLLBACK_PERSIST_ENABLED) {
     console.log(`[maestro] scrollback: ${SCROLLBACK_DIR}`);

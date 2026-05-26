@@ -32,12 +32,7 @@ export function saveState(s: MobileState) {
   } catch {}
 }
 
-export function uuid(): string {
-  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
-    return (crypto as Crypto).randomUUID();
-  }
-  return 'm-' + Math.random().toString(36).slice(2, 10);
-}
+export { uuid } from '../client-shared/uuid';
 
 /** The current origin is always available as an implicit, non-removable server. */
 export const THIS_DEVICE: MobileServerEntry = {

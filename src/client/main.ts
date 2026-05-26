@@ -1,5 +1,6 @@
 import { MaestroApi } from '../client-shared/api';
 import { escapeHtml } from '../client-shared/html';
+import { agentLabel } from '../client-shared/agent-labels';
 import { TerminalNode, type NodeStatus } from './node';
 import { attachPathPicker } from './path-picker';
 import { FileExplorer } from './file-explorer';
@@ -372,11 +373,6 @@ function activityLabel(a: SessionActivity, agentType: AgentType = 'claude'): str
   return 'state unknown';
 }
 
-function agentLabel(a: AgentType): string {
-  if (a === 'copilot') return 'GitHub Copilot CLI';
-  return 'Claude Code';
-}
-
 function agentBadge(a: AgentType): string {
   // Single-character mark. Color carries the rest of the meaning (see
   // .node__agent in styles.css). Hover the chip to see the full label.
@@ -560,16 +556,9 @@ function commitDragOrderFromDom(ref: DragRef) {
 
 function isAbove(e: DragEvent, el: HTMLElement): boolean {
   // Use the LAYOUT midline, not the visual midline. `getBoundingClientRect`
-  // reflects any active CSS transform — including the FLIP slide animation
-  // we apply during dragover-driven reorders. During that 180 ms slide a
-  // sibling is visually still in its old slot while its DOM position has
-  // already moved to the new one, so a visual-midline threshold oscillates
-  // and bumps the dragged element back and forth between adjacent slots.
-  // The most visible symptom: dragging to position #1 (top of list) is
-  // impossible because the moment the dragged element lands at slot 0, the
-  // sibling animating out of slot 0 is hit-tested in the lower half of its
-  // visual rect and immediately bumps the dragged element back to slot 1.
-  // Subtract the current translateY to get the untransformed top.
+  // reflects the FLIP slide transform during a reorder; without subtracting
+  // it the threshold oscillates and the dragged element ping-pongs between
+  // adjacent slots (most visibly: can't drop into slot 0).
   const r = el.getBoundingClientRect();
   let topY = r.top;
   const t = getComputedStyle(el).transform;

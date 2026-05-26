@@ -1,4 +1,5 @@
 import type { MaestroApi } from '../client-shared/api';
+import { debug } from '../client-shared/debug';
 
 /**
  * Attaches an autocomplete dropdown to a text input. Each keystroke debounces
@@ -91,7 +92,7 @@ export function attachPathPicker(input: HTMLInputElement): PathPicker {
       render();
     } catch (err) {
       if ((err as { name?: string })?.name === 'AbortError') return;
-      console.warn('[path-picker] complete failed:', (err as Error).message);
+      debug('[path-picker] complete failed:', (err as Error).message);
       hide();
     } finally {
       if (inFlight === controller) inFlight = null;

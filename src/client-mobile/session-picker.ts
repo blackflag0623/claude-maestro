@@ -2,15 +2,12 @@ import type { AgentType, SessionInfo } from '../shared/protocol';
 import { AGENT_TYPES } from '../shared/protocol';
 import { MaestroApi } from '../client-shared/api';
 import { escapeHtml as escape } from '../client-shared/html';
+import { agentLabel } from '../client-shared/agent-labels';
 import type { MobileServerEntry } from './mobile-state';
 
 export interface SessionPickerCallbacks {
   onPickSession: (sessionId: string) => void;
   onBack: () => void;
-}
-
-function agentLabel(a: AgentType): string {
-  return a === 'copilot' ? 'GitHub Copilot CLI' : 'Claude Code';
 }
 
 function agentBadge(a: AgentType): string {

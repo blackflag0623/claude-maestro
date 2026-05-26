@@ -123,9 +123,7 @@ export function saveState(s: PersistedState) {
   }
 }
 
-export function uuid(): string {
-  return crypto.randomUUID();
-}
+export { uuid } from '../client-shared/uuid';
 
 export interface ExportBundle {
   format: 'claude-maestro/servers';
