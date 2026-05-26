@@ -6,25 +6,48 @@
 // `~/.copilot/session-state/<uuid>/events.jsonl`. There is no hook system;
 // activity and chat updates come from tailing that file.
 //
-// Invocation shape (verified against `copilot --help` 1.0.55+):
-//   - new:    `copilot --session-id=<uuid>`
-//   - resume: `copilot --resume=<uuid>`
-// The `=` form is REQUIRED — copilot's parser treats `--session-id <uuid>`
-// (space-separated) as a boolean flag plus a positional resume name.
+// Two launch modes are supported:
+//
+//   1. DIRECT (default) — maestro owns the session uuid. Spawn invocation:
+//        new:    `copilot --session-id=<uuid>`
+//        resume: `copilot --resume=<uuid>`
+//      The `=` form is REQUIRED — copilot's parser treats `--session-id <uuid>`
+//      (space-separated) as a boolean flag plus a positional resume name.
+//
+//   2. AGENCY — `agency` wraps copilot (e.g. Microsoft devboxes). The wrapper
+//      injects its own session flags into the forwarded argv, so maestro
+//      MUST NOT pass `--session-id`. Spawn invocation:
+//        new:    `agency copilot`           (agency picks the uuid)
+//        resume: `agency copilot --resume=<copilotSessionId>`  (agency forwards
+//                                                                this through)
+//      Post-spawn for "new", maestro discovers the agency-issued uuid by
+//      watching `~/.copilot/session-state/` for a newly-created directory
+//      (see `discoverAgencyUuid` below), then records it on the session via
+//      `target.onCopilotSessionId(...)` so it's persisted for cross-restart
+//      resume.
+//
+// Mode detection (precedence):
+//   1. `MAESTRO_COPILOT_AGENCY=1` → agency mode (explicit opt-in).
+//   2. basename(MAESTRO_COPILOT_BIN) starts with `agency` (case-insensitive)
+//      → agency mode (auto-detect; the usual MS-devbox config).
+//   3. Otherwise → direct mode.
 //
 // Binary configuration:
 //   MAESTRO_COPILOT_BIN          path to the executable (default: `copilot`).
-//                                Paths with spaces are supported as-is — no
-//                                splitting, so Windows paths like
-//                                `C:\Program Files\copilot.exe` work.
+//                                On a Microsoft devbox, set to `agency`.
 //   MAESTRO_COPILOT_PREFIX_ARGS  optional whitespace-split prefix args
-//                                inserted before the session flag. Most users
-//                                leave this unset. Note: Microsoft's `agency`
-//                                wrapper is NOT supported here — it injects
-//                                its own `--resume <agency-uuid>` which
-//                                conflicts with maestro's `--session-id`.
-//                                Point MAESTRO_COPILOT_BIN at copilot.exe
-//                                directly instead.
+//                                inserted before the session flag. In agency
+//                                mode, this must contain `copilot` (so the
+//                                argv becomes `agency copilot [flags]`).
+//   MAESTRO_COPILOT_AGENCY       set to `1` to force agency mode regardless
+//                                of the binary name.
+//
+// Session id model:
+//   - `target.id` is always the maestro session id (used for WS routing,
+//     scrollback path, etc.).
+//   - `target.copilotSessionId` is the agent's own uuid (used to locate
+//     events.jsonl). In direct mode it equals `target.id`; in agency mode it
+//     is the agency-issued uuid (undefined until discovery completes).
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -102,12 +125,158 @@ if (!COPILOT_BIN_INFO.found) {
   );
 }
 
+// ───────── launch mode (direct vs agency) ─────────
+
+/** Recognised launch modes. Persisted per-session as `copilotLaunchMode` so
+ *  that a maestro restart in a different mode can detect the mismatch and
+ *  fail-closed rather than silently start a fresh agency session against an
+ *  existing direct-mode session's uuid. */
+export type CopilotLaunchMode = 'direct' | 'agency';
+
+function detectLaunchMode(): CopilotLaunchMode {
+  if (process.env.MAESTRO_COPILOT_AGENCY === '1') return 'agency';
+  const base = path.basename(COPILOT_BIN_RAW).toLowerCase();
+  // basename "agency", "agency.exe", "agency.cmd" all match. We avoid a
+  // bare `.includes('agency')` so a path like `C:\agency-tools\copilot.exe`
+  // does not get mis-detected.
+  if (base === 'agency' || base.startsWith('agency.')) return 'agency';
+  return 'direct';
+}
+
+export const COPILOT_LAUNCH_MODE: CopilotLaunchMode = detectLaunchMode();
+
+if (COPILOT_LAUNCH_MODE === 'agency') {
+  // Sanity check: in agency mode, prefix args must include `copilot` (or the
+  // user is on a setup we don't recognise). Warn loudly so the misconfig is
+  // visible at startup rather than at spawn time.
+  if (!COPILOT_PREFIX_ARGS.includes('copilot')) {
+    console.warn(
+      `[maestro] WARNING: Copilot launch mode = agency, but MAESTRO_COPILOT_PREFIX_ARGS does not include "copilot". ` +
+        `Expected env: MAESTRO_COPILOT_BIN=agency MAESTRO_COPILOT_PREFIX_ARGS=copilot. ` +
+        `Current MAESTRO_COPILOT_PREFIX_ARGS="${(process.env.MAESTRO_COPILOT_PREFIX_ARGS ?? '').trim()}".`,
+    );
+  }
+  console.warn(`[maestro] Copilot launch mode: agency (binary="${COPILOT_BIN_RAW}")`);
+}
+
 // ───────── events.jsonl helpers ─────────
 
 const COPILOT_STATE_DIR = path.join(os.homedir(), '.copilot', 'session-state');
 
 function eventsPathFor(sessionId: string): string {
   return path.join(COPILOT_STATE_DIR, sessionId, 'events.jsonl');
+}
+
+/** Resolve the copilot uuid that backs a given target. In direct mode this
+ *  is always `target.id`. In agency mode it's `target.copilotSessionId` once
+ *  discovery has completed (otherwise `undefined`). */
+function resolveCopilotId(target: SpawnTarget): string | undefined {
+  if (COPILOT_LAUNCH_MODE === 'direct') return target.copilotSessionId ?? target.id;
+  return target.copilotSessionId;
+}
+
+// ───────── agency-mode discovery ─────────
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const AGENCY_DISCOVERY_POLL_MS = 200;
+const AGENCY_DISCOVERY_TIMEOUT_MS = 10_000;
+/** Clock-skew slop applied when comparing dir birth/ctime to spawn time. */
+const AGENCY_DISCOVERY_CTIME_SLOP_MS = 1_000;
+
+/** Mutex: only one agency-mode spawn is in its discovery window at a time.
+ *  Doesn't protect against other shells / other maestro processes on the same
+ *  OS user (those are covered by the ctime filter + multi-candidate fail-
+ *  closed below) — but eliminates intra-process races. */
+let agencyDiscoveryChain: Promise<void> = Promise.resolve();
+
+interface AgencyDiscoveryResult {
+  ok: true;
+  copilotSessionId: string;
+}
+interface AgencyDiscoveryFailure {
+  ok: false;
+  reason: string;
+}
+
+/** List uuid-named dirs in COPILOT_STATE_DIR with their ctime. Returns an
+ *  empty array if the dir doesn't yet exist (first-ever copilot run on the
+ *  host). */
+function listSessionStateDirs(): Map<string, number> {
+  const out = new Map<string, number>();
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(COPILOT_STATE_DIR, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const ent of entries) {
+    if (!ent.isDirectory()) continue;
+    if (!UUID_RE.test(ent.name)) continue;
+    try {
+      const st = fs.statSync(path.join(COPILOT_STATE_DIR, ent.name));
+      // birthtime is preferred (Windows always supports it); ctime is the
+      // POSIX fallback.
+      const ts = st.birthtimeMs > 0 ? st.birthtimeMs : st.ctimeMs;
+      out.set(ent.name, ts);
+    } catch {
+      // unreadable — skip
+    }
+  }
+  return out;
+}
+
+/** Watch `COPILOT_STATE_DIR` for a NEW uuid-named directory that appeared
+ *  after `spawnTime` and is not in `preSnapshot`. Resolves with the chosen
+ *  uuid, or a failure with a human-readable reason.
+ *
+ *  Correctness rules (in priority order):
+ *    1. Filter to dirs whose ctime/birthtime >= spawnTime - slop (eliminates
+ *       races against unrelated pre-existing dirs that were missed by the
+ *       pre-snapshot for some reason).
+ *    2. Filter to dirs NOT in pre-snapshot (eliminates pre-existing dirs).
+ *    3. If exactly one candidate emerges → adopt it.
+ *    4. If multiple candidates emerge (another agency-copilot ran in another
+ *       shell at the same time) → fail closed.
+ *    5. If no candidates within the timeout → fail closed. */
+async function watchForAgencyUuid(
+  preSnapshot: Set<string>,
+  spawnTime: number,
+  signal: { cancelled: boolean },
+): Promise<AgencyDiscoveryResult | AgencyDiscoveryFailure> {
+  const deadline = Date.now() + AGENCY_DISCOVERY_TIMEOUT_MS;
+  const ctimeFloor = spawnTime - AGENCY_DISCOVERY_CTIME_SLOP_MS;
+
+  while (Date.now() < deadline) {
+    if (signal.cancelled) {
+      return { ok: false, reason: 'discovery cancelled (PTY exited before adoption)' };
+    }
+    const current = listSessionStateDirs();
+    const candidates: string[] = [];
+    for (const [name, ts] of current) {
+      if (preSnapshot.has(name)) continue;
+      if (ts < ctimeFloor) continue;
+      candidates.push(name);
+    }
+    if (candidates.length === 1) {
+      return { ok: true, copilotSessionId: candidates[0]! };
+    }
+    if (candidates.length > 1) {
+      return {
+        ok: false,
+        reason:
+          `multiple new session-state directories observed within the discovery window ` +
+          `(${candidates.join(', ')}). This usually means another \`agency copilot\` was started ` +
+          `concurrently from a different shell. Refusing to guess which one belongs to this maestro session.`,
+      };
+    }
+    await new Promise<void>((r) => setTimeout(r, AGENCY_DISCOVERY_POLL_MS));
+  }
+  return {
+    ok: false,
+    reason: `no new ~/.copilot/session-state/<uuid>/ directory appeared within ${
+      AGENCY_DISCOVERY_TIMEOUT_MS / 1000
+    }s. Agency may have failed to launch copilot, or copilot's state directory layout has changed.`,
+  };
 }
 
 /** Translate one parsed event object into a ChatMessage, or null if not a
@@ -179,7 +348,15 @@ const POLL_INTERVAL_MS = 400;
 const HISTORY_WARN_BYTES = 10 * 1024 * 1024;
 
 /** Tail copilot's events.jsonl with the same pread+offset+StringDecoder
- *  pattern as Claude's `TranscriptReader`. */
+ *  pattern as Claude's `TranscriptReader`.
+ *
+ *  Agency-mode subtlety: at construction time, the file path may not be
+ *  resolvable (target.copilotSessionId is not yet set). The reader holds the
+ *  target by reference and re-derives the path on every tick. When the path
+ *  first becomes resolvable AND the file exists, we run the deferred
+ *  "initial scan" (advance offset to EOF, derive activity from history) so
+ *  resuming agency sessions don't replay history as live updates. Direct
+ *  mode behavior is unchanged. */
 class CopilotReader implements AgentReader {
   // Offset state for the *live* tailer. Independent of `readAll()` which
   // does its own fresh whole-file read on every call.
@@ -188,22 +365,54 @@ class CopilotReader implements AgentReader {
   private decoder = new StringDecoder('utf8');
   private timer: NodeJS.Timeout | null = null;
   private cb: ReaderCallbacks | null;
-  private readonly filePath: string;
+  private readonly target: SpawnTarget;
   private readonly logTag: string;
+  /** Records the path against which `offset` is valid. If the path changes
+   *  mid-tail (agency discovery flips the resolution), we reset offsets and
+   *  re-run the initial scan against the new file. */
+  private boundPath: string | null = null;
+  /** Set after a successful initial scan against `boundPath`. Reset on path
+   *  change. */
+  private initialScanned = false;
 
   constructor(target: SpawnTarget, cb: ReaderCallbacks) {
-    this.filePath = eventsPathFor(target.id);
+    this.target = target;
     this.cb = cb;
     this.logTag = `[copilot.reader] ${target.id.slice(0, 8)}`;
 
-    // Initial scan: if events.jsonl already exists (resumed session, or a
-    // restart between PTY spawn and Maestro startup), advance the live-tail
-    // offset to EOF so we don't re-emit historical events as "live", and
-    // derive the latest activity from history so the UI reflects the true
-    // state on first attach. For brand-new sessions the file doesn't exist
-    // yet; first tick discovers it and emits everything from offset 0.
+    // Eager initial scan for direct-mode resumes (file already on disk). For
+    // agency-mode new sessions the path isn't yet resolvable; the first few
+    // ticks no-op until discovery sets target.copilotSessionId, at which
+    // point tick() re-runs the initial scan against the new path.
+    this.maybeInitialScan();
+    this.startPolling();
+  }
+
+  /** Current path to events.jsonl, or null if the copilot uuid is not yet
+   *  known (agency mode, pre-discovery). */
+  private currentPath(): string | null {
+    const sid = resolveCopilotId(this.target);
+    return sid ? eventsPathFor(sid) : null;
+  }
+
+  /** Initial scan logic: parse the entire existing file once, advance
+   *  `offset` to EOF, and derive activity from the last activity-bearing
+   *  event. Idempotent — only runs once per `boundPath`. Returns true if a
+   *  scan was successfully completed (or already had been). */
+  private maybeInitialScan(): boolean {
+    const p = this.currentPath();
+    if (!p) return false;
+    if (p !== this.boundPath) {
+      // Path changed (or first resolution). Reset before scanning.
+      this.offset = 0;
+      this.partial = '';
+      this.decoder = new StringDecoder('utf8');
+      this.boundPath = p;
+      this.initialScanned = false;
+    }
+    if (this.initialScanned) return true;
     try {
-      const buf = fs.readFileSync(this.filePath, 'utf8');
+      const buf = fs.readFileSync(p, 'utf8');
       let last: SessionActivity | null = null;
       for (const line of buf.split('\n')) {
         const trimmed = line.trim();
@@ -218,21 +427,22 @@ class CopilotReader implements AgentReader {
         if (a) last = a;
       }
       this.offset = Buffer.byteLength(buf, 'utf8');
-      if (last) cb.onActivity(last);
-      debug(`${this.logTag} initial scan: offset=${this.offset}, activity=${last ?? 'none'}`);
+      if (last && this.cb) this.cb.onActivity(last);
+      this.initialScanned = true;
+      debug(`${this.logTag} initial scan: offset=${this.offset}, activity=${last ?? 'none'} (${p})`);
+      return true;
     } catch {
-      // file not yet written — fine, first tick handles it.
+      // File not yet written; will retry on next tick.
+      return false;
     }
-
-    this.startPolling();
   }
 
   readAll(): ChatMessage[] {
-    // Fresh whole-file read. Does NOT touch live-tail offset state — that's
-    // managed independently by tick(). Safe to call any number of times.
+    const p = this.currentPath();
+    if (!p) return [];
     let buf: string;
     try {
-      buf = fs.readFileSync(this.filePath, 'utf8');
+      buf = fs.readFileSync(p, 'utf8');
     } catch {
       return [];
     }
@@ -261,9 +471,12 @@ class CopilotReader implements AgentReader {
 
   private tick(): void {
     if (!this.cb) return;
+    // Detect path resolution / change; do initial scan when ready.
+    if (!this.maybeInitialScan()) return;
+    const p = this.boundPath!;
     let st: fs.Stats;
     try {
-      st = fs.statSync(this.filePath);
+      st = fs.statSync(p);
     } catch {
       return; // file not written yet
     }
@@ -277,7 +490,7 @@ class CopilotReader implements AgentReader {
     const length = st.size - this.offset;
     let chunk: string;
     try {
-      const fd = fs.openSync(this.filePath, 'r');
+      const fd = fs.openSync(p, 'r');
       try {
         const buf = Buffer.allocUnsafe(length);
         const read = fs.readSync(fd, buf, 0, length, this.offset);
@@ -289,7 +502,7 @@ class CopilotReader implements AgentReader {
     } catch (err) {
       debug(`${this.logTag} pread failed (${(err as Error).message}), fallback`);
       try {
-        const whole = fs.readFileSync(this.filePath, 'utf8');
+        const whole = fs.readFileSync(p, 'utf8');
         const totalBytes = Buffer.byteLength(whole, 'utf8');
         if (totalBytes < this.offset) {
           this.offset = 0;
@@ -355,19 +568,10 @@ export const copilotStrategy: AgentStrategy = {
   displayName: 'GitHub Copilot CLI',
 
   spawn(target: SpawnTarget, mode: SpawnMode): pty.IPty {
-    // Defensive: if events.jsonl already exists for this session ID, force
-    // --resume even if hasResumeData was false. Catches the edge case where
-    // Maestro crashed between events.jsonl creation and the first PTY output
-    // that would normally have flipped hasResumeData.
-    const effectiveMode: SpawnMode =
-      mode === 'new' && fs.existsSync(eventsPathFor(target.id)) ? 'resume' : mode;
-    const sessionFlag = effectiveMode === 'new' ? '--session-id' : '--resume';
-    // Copilot's CLI parser requires `--flag=value`, not `--flag value`. Passing
-    // them as two tokens makes copilot treat the uuid as a positional resume
-    // name, which fails with "No session, task, or name matched '<uuid>'".
-    const args = [...COPILOT_PREFIX_ARGS, `${sessionFlag}=${target.id}`];
+    const args = buildSpawnArgs(target, mode);
+    let term: pty.IPty;
     try {
-      return pty.spawn(COPILOT_BIN, args, {
+      term = pty.spawn(COPILOT_BIN, args, {
         name: 'xterm-256color',
         cols: target.cols,
         rows: target.rows,
@@ -375,31 +579,19 @@ export const copilotStrategy: AgentStrategy = {
         env: { ...process.env, MAESTRO_SESSION: target.id } as Record<string, string>,
       });
     } catch (err) {
-      const inner = (err as Error).message || String(err);
-      const parts = [
-        `failed to spawn Copilot CLI: ${inner}`,
-        `  attempted binary: ${COPILOT_BIN}`,
-      ];
-      if (COPILOT_BIN_RAW !== COPILOT_BIN) {
-        parts.push(`  configured name:  ${COPILOT_BIN_RAW}`);
-      }
-      if (!COPILOT_BIN_INFO.found) {
-        parts.push(
-          `  resolution:       NOT FOUND on PATH at server startup`,
-          `  fix:              install Copilot CLI on this host (e.g. \`npm install -g @github/copilot\` or \`winget install GitHub.Copilot\`),`,
-          `                    or set MAESTRO_COPILOT_BIN to an absolute path to the executable, then restart maestro.`,
-        );
-      } else {
-        parts.push(
-          `  resolution:       found on PATH`,
-          `  hint:             if this is a wrapper script or symlink that node-pty can't execute,`,
-          `                    set MAESTRO_COPILOT_BIN to the real target binary and restart maestro.`,
-        );
-      }
-      const message = parts.join('\n');
-      console.error(`[maestro] ${message}`);
-      throw new Error(message);
+      throw buildSpawnError(err, args);
     }
+
+    // Agency mode + new session: agency owns the uuid; we discover it after
+    // spawn by watching `~/.copilot/session-state/` for a new dir. The
+    // CopilotReader holds `target` by reference and re-resolves the events
+    // path on each tick, so once we set `target.copilotSessionId` and call
+    // `target.onCopilotSessionId(...)` the reader picks up automatically.
+    if (COPILOT_LAUNCH_MODE === 'agency' && !target.copilotSessionId) {
+      kickOffAgencyDiscovery(target, term);
+    }
+
+    return term;
   },
 
   createReader(target: SpawnTarget, cb: ReaderCallbacks): AgentReader {
@@ -408,3 +600,103 @@ export const copilotStrategy: AgentStrategy = {
 
   // Copilot has no hook system — activity and chat come from events.jsonl.
 };
+
+// ───────── spawn helpers ─────────
+
+function buildSpawnArgs(target: SpawnTarget, mode: SpawnMode): string[] {
+  if (COPILOT_LAUNCH_MODE === 'agency') {
+    // Agency owns the uuid for new sessions. For resume, we forward the
+    // agency-issued uuid back through agency to copilot. Empirically (user-
+    // verified) agency forwards `--resume=<uuid>` through.
+    if (mode === 'resume' && target.copilotSessionId) {
+      return [...COPILOT_PREFIX_ARGS, `--resume=${target.copilotSessionId}`];
+    }
+    return [...COPILOT_PREFIX_ARGS];
+  }
+
+  // Direct mode. Defensive: if events.jsonl already exists for this session
+  // ID, force --resume even if hasResumeData was false. Catches the edge
+  // case where Maestro crashed between events.jsonl creation and the first
+  // PTY output that would normally have flipped hasResumeData.
+  const effectiveMode: SpawnMode =
+    mode === 'new' && fs.existsSync(eventsPathFor(target.id)) ? 'resume' : mode;
+  const sessionFlag = effectiveMode === 'new' ? '--session-id' : '--resume';
+  // Copilot's CLI parser requires `--flag=value`, not `--flag value`. Passing
+  // them as two tokens makes copilot treat the uuid as a positional resume
+  // name, which fails with "No session, task, or name matched '<uuid>'".
+  return [...COPILOT_PREFIX_ARGS, `${sessionFlag}=${target.id}`];
+}
+
+function buildSpawnError(err: unknown, args: readonly string[]): Error {
+  const inner = (err as Error).message || String(err);
+  const parts = [
+    `failed to spawn Copilot CLI: ${inner}`,
+    `  attempted binary: ${COPILOT_BIN}`,
+    `  argv:             ${args.join(' ')}`,
+    `  launch mode:      ${COPILOT_LAUNCH_MODE}`,
+  ];
+  if (COPILOT_BIN_RAW !== COPILOT_BIN) {
+    parts.push(`  configured name:  ${COPILOT_BIN_RAW}`);
+  }
+  if (!COPILOT_BIN_INFO.found) {
+    parts.push(
+      `  resolution:       NOT FOUND on PATH at server startup`,
+      `  fix:              install Copilot CLI on this host (e.g. \`npm install -g @github/copilot\` or \`winget install GitHub.Copilot\`),`,
+      `                    or set MAESTRO_COPILOT_BIN to an absolute path to the executable, then restart maestro.`,
+    );
+  } else {
+    parts.push(
+      `  resolution:       found on PATH`,
+      `  hint:             if this is a wrapper script or symlink that node-pty can't execute,`,
+      `                    set MAESTRO_COPILOT_BIN to the real target binary and restart maestro.`,
+    );
+  }
+  const message = parts.join('\n');
+  console.error(`[maestro] ${message}`);
+  return new Error(message);
+}
+
+/** Snapshot session-state dirs, await mutex, then race a watcher against the
+ *  PTY-exit signal. On success: mutate `target.copilotSessionId` and notify
+ *  the server via `target.onCopilotSessionId(...)`. On failure: emit a
+ *  diagnostic; the reader will keep no-oping (no copilotSessionId set), and
+ *  the user will see no chat history. The PTY itself continues running. */
+function kickOffAgencyDiscovery(target: SpawnTarget, term: pty.IPty): void {
+  const preSnapshot = new Set(listSessionStateDirs().keys());
+  const spawnTime = Date.now();
+  const signal = { cancelled: false };
+
+  // If the PTY exits before discovery completes, cancel — the session is
+  // dead and there's no point continuing to poll.
+  term.onExit(() => {
+    signal.cancelled = true;
+  });
+
+  agencyDiscoveryChain = agencyDiscoveryChain.then(async () => {
+    debug(
+      `[copilot.agency] discovery start session=${target.id.slice(0, 8)} ` +
+        `preSnapshot=${preSnapshot.size}`,
+    );
+    const result = await watchForAgencyUuid(preSnapshot, spawnTime, signal);
+    if (!result.ok) {
+      console.error(
+        `[maestro] Copilot agency-mode session ${target.id} discovery failed: ${result.reason}`,
+      );
+      return;
+    }
+    debug(
+      `[copilot.agency] discovered session=${target.id.slice(0, 8)} → ` +
+        `copilotSessionId=${result.copilotSessionId}`,
+    );
+    target.copilotSessionId = result.copilotSessionId;
+    try {
+      target.onCopilotSessionId?.(result.copilotSessionId);
+    } catch (err) {
+      console.error(
+        `[maestro] onCopilotSessionId callback threw for session ${target.id}: ${
+          (err as Error).message
+        }`,
+      );
+    }
+  });
+}

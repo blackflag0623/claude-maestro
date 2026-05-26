@@ -89,9 +89,21 @@ Strategies are registered as side-effects of importing `agents/all.ts`, which al
 | Var | Default | Whitespace-split? | Purpose |
 | --- | --- | --- | --- |
 | `MAESTRO_CLAUDE_BIN` | `claude` | no | Path to the Claude binary (supports spaces). |
-| `MAESTRO_COPILOT_BIN` | `copilot` | no | Path to the Copilot binary (supports spaces). |
-| `MAESTRO_COPILOT_PREFIX_ARGS` | _(unset)_ | yes | Optional args inserted between the binary and the session flag. Most users leave this unset. **Do not** use this with Microsoft's `agency` launcher — `agency` injects its own `--resume` and conflicts with maestro's `--session-id`; see KNOWN_ISSUES.md. |
+| `MAESTRO_COPILOT_BIN` | `copilot` | no | Path to the Copilot binary (supports spaces). On Microsoft devboxes, point this at `agency` and **also** set `MAESTRO_COPILOT_PREFIX_ARGS=copilot` to launch via `agency copilot` (see "Copilot launch modes" below). |
+| `MAESTRO_COPILOT_PREFIX_ARGS` | _(unset)_ | yes | Optional args inserted between the binary and the session flag. In direct mode, leave unset. In agency mode, set to `copilot` (the subcommand `agency` dispatches to). |
+| `MAESTRO_COPILOT_AGENCY` | _(unset)_ | no | Set to `1` to force agency launch mode regardless of `MAESTRO_COPILOT_BIN` basename. Useful when `MAESTRO_COPILOT_BIN` is an absolute path or wrapper whose basename isn't `agency`. |
 | `MAESTRO_STORE_DIR` | `~/.claude-maestro` | no | Override the registry directory. |
+
+**Copilot launch modes:**
+
+The Copilot strategy supports two launch modes, detected at maestro startup:
+
+- **`direct`** (default) — maestro owns the session uuid and passes it as `--session-id=<uuid>` for new sessions, `--resume=<uuid>` for resume. Used when `MAESTRO_COPILOT_BIN` points directly at `copilot` (or `copilot.exe`, `copilot.cmd`, …).
+- **`agency`** — for Microsoft devboxes where Copilot must be launched through the `agency` wrapper (auth, env, sandbox). Agency injects its own `--session-id` for new sessions, so maestro must NOT pass one. Maestro discovers the agency-issued uuid post-spawn by snapshotting `~/.copilot/session-state/` before the spawn and watching for the newly created dir (10 s timeout, 200 ms poll, birthtime/ctime-filtered, fails closed on zero/multiple matches). The discovered uuid is persisted as `copilotSessionId`. For resume, maestro issues `agency copilot --resume=<copilotSessionId>` — verified to forward through `agency` to `copilot`.
+
+Mode detection priority: `MAESTRO_COPILOT_AGENCY=1` (explicit override) > `path.basename(MAESTRO_COPILOT_BIN).toLowerCase()` is `agency` or starts with `agency.` (catches `agency.exe`, `agency.cmd`) > `direct`.
+
+Each Copilot session records its launch mode at create time (`copilotLaunchMode` in `sessions.json`). If maestro restarts in a different mode, spawn fails closed with a clear error rather than silently starting a fresh session and losing conversation history. To switch modes for an existing session, restart maestro with the original env vars, or delete the session and create a new one.
 
 **Copilot events.jsonl mapping** (`agents/copilot.ts`):
 

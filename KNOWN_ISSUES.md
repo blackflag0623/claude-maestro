@@ -52,11 +52,13 @@ _(none recorded yet)_
 
 ## Agent integrations
 
-### Copilot CLI launched via the Microsoft `agency` wrapper — **not supported**
+### Copilot CLI launched via the Microsoft `agency` wrapper — supported, with caveats
 
-- **Symptom:** Spawning a Copilot node via `MAESTRO_COPILOT_BIN=agency` + `MAESTRO_COPILOT_PREFIX_ARGS=copilot` fails with `Error: option '--session-id <id>' cannot be used with option '--resume[=value]'` (or, with the older `--session-id <uuid>` two-token form, the more confusing `Error: No session, task, or name matched '<uuid>'`).
-- **Root cause:** `agency` synthesizes its **own** session UUID and unconditionally injects `--resume <agency-uuid>` into the underlying `copilot.exe` invocation. There is no agency flag to suppress this. Maestro then appends `--session-id=<our-uuid>`, and Copilot rejects the conflict. Verified by inspecting the live `copilot.exe` command line via `Get-CimInstance Win32_Process` while `agency copilot --acp` was running — agency had already added `--resume f2a70fe3-…` before our args.
-- **Workaround:** **Bypass `agency` entirely.** On Microsoft devboxes the underlying Copilot CLI is on `PATH` at `C:\Users\<you>\AppData\Local\Microsoft\WinGet\Links\copilot.exe`, so the defaults (`MAESTRO_COPILOT_BIN=copilot`, no `MAESTRO_COPILOT_PREFIX_ARGS`) just work — clear those env vars before starting maestro. If `copilot` is not on `PATH` for the maestro process, point `MAESTRO_COPILOT_BIN` directly at the full `copilot.exe` path (still no prefix args). Agency's own job (session lifecycle, MCP wiring) overlaps with what maestro itself does, so going through it is not just unsupported but undesirable.
+Agency mode is now a first-class Copilot launch mode (see CLAUDE.md → "Copilot launch modes"). Enable by setting `MAESTRO_COPILOT_BIN=agency` and `MAESTRO_COPILOT_PREFIX_ARGS=copilot` (or set `MAESTRO_COPILOT_AGENCY=1` to force the mode without renaming the binary). Two known limitations:
+
+- **Concurrent `agency copilot` from another shell during the discovery window.** In agency mode maestro snapshots `~/.copilot/session-state/` immediately before spawning and watches for the new uuid-named dir for up to 10 s. If a different shell on the same OS user also runs `agency copilot` inside that window, both new dirs will pass the birthtime filter and maestro will **fail closed** with `multiple new session-state directories observed: …`, refusing to guess which uuid belongs to its child PTY. The PTY itself remains running but maestro never wires up the events.jsonl tail, so chat history and activity indicators stay empty. **Workaround:** kill the half-attached node and retry the create once the other invocation has fully settled (~1 s).
+
+- **Launch-mode lock per session.** Each Copilot session records `copilotLaunchMode` (`direct` or `agency`) at create time. If maestro restarts with a different mode, spawn for that session fails closed with a clear mismatch error rather than silently starting a fresh conversation. **Workaround:** restart maestro with the original env vars (set/unset `MAESTRO_COPILOT_AGENCY` and `MAESTRO_COPILOT_BIN` accordingly), or delete the session and create a new one.
 
 ### Copilot CLI mobile chat: tool-only turns appear silent
 

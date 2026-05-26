@@ -20,13 +20,27 @@ import type {
 export type SpawnMode = 'new' | 'resume';
 
 /** The subset of session state a strategy needs to spawn / read for a
- *  session. We pass a value (not the live Session) so strategies don't gain
- *  surface area on internal session fields. */
+ *  session. The maestro session id (`id`) is always present; agent-specific
+ *  fields below are populated only for agents that use them. The object is
+ *  passed live (mutable) so a strategy can record a post-spawn discovery
+ *  (e.g. Copilot agency mode) by writing back onto the same target. */
 export interface SpawnTarget {
   id: string;
   cwd: string;
   cols: number;
   rows: number;
+  /** For Copilot: the agent's own session uuid as recorded by the server, if
+   *  known. Direct mode: equals `id` (the historical invariant). Agency mode:
+   *  may be `undefined` on first spawn (will be discovered post-spawn) and is
+   *  set to the agency-issued uuid on subsequent spawns. Ignored by non-
+   *  Copilot agents. */
+  copilotSessionId?: string;
+  /** Called by the Copilot strategy after discovering an agency-issued uuid
+   *  for a freshly-spawned agency session. The server persists this to
+   *  `sessions.json` and updates the live session record. Strategies SHOULD
+   *  also mutate `target.copilotSessionId` so downstream consumers (the
+   *  reader) see the change immediately. No-op for non-Copilot agents. */
+  onCopilotSessionId?: (id: string) => void;
 }
 
 /** Callbacks an `AgentReader` invokes when it observes new events. The server

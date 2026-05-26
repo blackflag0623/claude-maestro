@@ -21,6 +21,7 @@ import type {
 import { AGENT_TYPES } from '../shared/protocol.js';
 import { getStrategy, type AgentReader, type SpawnTarget } from './agents/index.js';
 import { initAgentEnvironments } from './agents/all.js';
+import { COPILOT_LAUNCH_MODE } from './agents/copilot.js';
 
 function isAgentType(x: unknown): x is AgentType {
   return typeof x === 'string' && (AGENT_TYPES as readonly string[]).includes(x);
@@ -63,6 +64,17 @@ interface PersistedSession {
   /** Which CLI agent backs this session. Defaults to `'claude'` on load for
    *  records persisted before the agent abstraction was introduced. */
   agentType: AgentType;
+  /** Copilot only: which launch mode this session was created with. Affects
+   *  spawn argv shape and how `copilotSessionId` is interpreted. Missing →
+   *  treat as `'direct'` for back-compat with sessions persisted before the
+   *  agency launch mode was introduced. */
+  copilotLaunchMode?: 'direct' | 'agency';
+  /** Copilot only: the agent's own session uuid. In direct mode this equals
+   *  `id`. In agency mode it is the agency-issued uuid, populated post-spawn
+   *  by the strategy after watching `~/.copilot/session-state/`. Missing →
+   *  not yet discovered (agency-new pre-discovery) OR direct mode (use `id`
+   *  as the fallback at spawn time). */
+  copilotSessionId?: string;
 }
 
 interface Session extends PersistedSession {
@@ -96,6 +108,8 @@ function persist() {
     createdAt: s.createdAt,
     hasResumeData: s.hasResumeData,
     agentType: s.agentType,
+    copilotLaunchMode: s.copilotLaunchMode,
+    copilotSessionId: s.copilotSessionId,
   }));
   try {
     fs.mkdirSync(STORE_DIR, { recursive: true });
@@ -137,6 +151,8 @@ function loadPersisted() {
       createdAt: p.createdAt ?? Date.now(),
       hasResumeData: p.hasResumeData ?? false,
       agentType,
+      copilotLaunchMode: p.copilotLaunchMode,
+      copilotSessionId: p.copilotSessionId,
       term: null,
       cols: 120,
       rows: 30,
@@ -370,7 +386,42 @@ const READER_DISPOSE_GRACE_MS = 1500;
 
 function spawnAgent(s: Session, mode: 'new' | 'resume') {
   const strategy = getStrategy(s.agentType);
-  const target: SpawnTarget = { id: s.id, cwd: s.cwd, cols: s.cols, rows: s.rows };
+
+  // Copilot launch-mode mismatch guard: a session persisted under one mode
+  // (direct vs agency) cannot be revived in the other — the spawn argv shape
+  // and uuid ownership differ. Silent-fresh-start would silently lose
+  // conversation history, so fail closed with a clear message.
+  if (s.agentType === 'copilot') {
+    const persistedMode = s.copilotLaunchMode ?? 'direct';
+    if (persistedMode !== COPILOT_LAUNCH_MODE) {
+      throw new Error(
+        `Copilot session ${s.id} was created in '${persistedMode}' launch mode, ` +
+          `but this maestro process is running in '${COPILOT_LAUNCH_MODE}' mode. ` +
+          `To resume this session, restart maestro with the original mode ` +
+          `(set/unset MAESTRO_COPILOT_AGENCY and MAESTRO_COPILOT_BIN accordingly). ` +
+          `To start over, delete the session and create a new one.`,
+      );
+    }
+    // Direct-mode sessions: copilotSessionId is always equal to id. For old
+    // pre-feature records this field is undefined on disk; backfill so the
+    // reader's path resolution finds the events.jsonl immediately.
+    if (persistedMode === 'direct' && !s.copilotSessionId) {
+      s.copilotSessionId = s.id;
+    }
+  }
+
+  const target: SpawnTarget = {
+    id: s.id,
+    cwd: s.cwd,
+    cols: s.cols,
+    rows: s.rows,
+    copilotSessionId: s.copilotSessionId,
+    onCopilotSessionId: (copilotSessionId: string) => {
+      if (s.copilotSessionId === copilotSessionId) return;
+      s.copilotSessionId = copilotSessionId;
+      persist();
+    },
+  };
 
   const term = strategy.spawn(target, mode);
   s.term = term;
@@ -444,6 +495,14 @@ function createSession(body: CreateSessionBody): Session {
     createdAt: Date.now(),
     hasResumeData: false,
     agentType,
+    // Copilot-only: record the launch mode at create time so a future
+    // maestro restart in a different mode can fail closed instead of
+    // silently starting fresh. In direct mode, the copilot uuid equals our
+    // id; in agency mode, agency owns the uuid and we discover it post-
+    // spawn (copilotSessionId stays undefined until then).
+    copilotLaunchMode: agentType === 'copilot' ? COPILOT_LAUNCH_MODE : undefined,
+    copilotSessionId:
+      agentType === 'copilot' && COPILOT_LAUNCH_MODE === 'direct' ? id : undefined,
     term: null,
     cols: body.cols ?? 120,
     rows: body.rows ?? 30,
