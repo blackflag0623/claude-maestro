@@ -112,17 +112,34 @@ function resolveBin(name: string): ResolvedBin {
 const COPILOT_BIN_INFO = resolveBin(COPILOT_BIN_RAW);
 const COPILOT_BIN = COPILOT_BIN_INFO.path;
 
+/** True iff `agency` exists on PATH — used to steer users on Microsoft
+ *  devboxes toward agency launch mode when `copilot` isn't directly on PATH.
+ *  Resolved once at module load; intentionally cheap (no spawn). */
+const AGENCY_ON_PATH = resolveBin('agency').found;
+
 if (!COPILOT_BIN_INFO.found) {
   // Surface immediately at startup so the operator sees it before the first
   // user attempts a Copilot session and hits the (less helpful) spawn-time
   // failure on the wire.
-  console.warn(
-    `[maestro] WARNING: Copilot CLI binary "${COPILOT_BIN_RAW}" not found on PATH. ` +
-      `Copilot sessions will fail to spawn until either (a) "${COPILOT_BIN_RAW}" is installed and on PATH ` +
-      `for the maestro server process, or (b) MAESTRO_COPILOT_BIN is set to an absolute path to the executable. ` +
-      `Install hint: \`npm install -g @github/copilot\` (then ensure the npm global bin dir is on PATH), ` +
-      `or on Windows install via WinGet (\`winget install GitHub.Copilot\`).`,
-  );
+  if (AGENCY_ON_PATH && COPILOT_BIN_RAW === 'copilot') {
+    console.warn(
+      `[maestro] WARNING: Copilot CLI binary "copilot" not found on PATH, but "agency" IS on PATH. ` +
+        `This looks like a Microsoft devbox. Enable agency launch mode by setting these env vars ` +
+        `before starting maestro:\n` +
+        `    MAESTRO_COPILOT_BIN=agency\n` +
+        `    MAESTRO_COPILOT_PREFIX_ARGS=copilot\n` +
+        `(or just MAESTRO_COPILOT_AGENCY=1 if you keep MAESTRO_COPILOT_BIN unset, but you still need PREFIX_ARGS=copilot). ` +
+        `See CLAUDE.md → "Copilot launch modes".`,
+    );
+  } else {
+    console.warn(
+      `[maestro] WARNING: Copilot CLI binary "${COPILOT_BIN_RAW}" not found on PATH. ` +
+        `Copilot sessions will fail to spawn until either (a) "${COPILOT_BIN_RAW}" is installed and on PATH ` +
+        `for the maestro server process, or (b) MAESTRO_COPILOT_BIN is set to an absolute path to the executable. ` +
+        `Install hint: \`npm install -g @github/copilot\` (then ensure the npm global bin dir is on PATH), ` +
+        `or on Windows install via WinGet (\`winget install GitHub.Copilot\`).`,
+    );
+  }
 }
 
 // ───────── launch mode (direct vs agency) ─────────
@@ -639,11 +656,22 @@ function buildSpawnError(err: unknown, args: readonly string[]): Error {
     parts.push(`  configured name:  ${COPILOT_BIN_RAW}`);
   }
   if (!COPILOT_BIN_INFO.found) {
-    parts.push(
-      `  resolution:       NOT FOUND on PATH at server startup`,
-      `  fix:              install Copilot CLI on this host (e.g. \`npm install -g @github/copilot\` or \`winget install GitHub.Copilot\`),`,
-      `                    or set MAESTRO_COPILOT_BIN to an absolute path to the executable, then restart maestro.`,
-    );
+    if (AGENCY_ON_PATH && COPILOT_BIN_RAW === 'copilot') {
+      parts.push(
+        `  resolution:       NOT FOUND on PATH at server startup`,
+        `  detected:         "agency" IS on PATH — this looks like a Microsoft devbox.`,
+        `  fix:              restart maestro with agency launch mode enabled:`,
+        `                        MAESTRO_COPILOT_BIN=agency`,
+        `                        MAESTRO_COPILOT_PREFIX_ARGS=copilot`,
+        `                    (see CLAUDE.md → "Copilot launch modes")`,
+      );
+    } else {
+      parts.push(
+        `  resolution:       NOT FOUND on PATH at server startup`,
+        `  fix:              install Copilot CLI on this host (e.g. \`npm install -g @github/copilot\` or \`winget install GitHub.Copilot\`),`,
+        `                    or set MAESTRO_COPILOT_BIN to an absolute path to the executable, then restart maestro.`,
+      );
+    }
   } else {
     parts.push(
       `  resolution:       found on PATH`,
