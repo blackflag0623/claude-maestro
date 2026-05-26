@@ -151,6 +151,25 @@ Each agent CLI writes its conversation to a known on-disk file (Claude: `~/.clau
 
 **Implications**: any repo works out of the box — no CLAUDE.md changes required in target repos to enable mobile chat. The chat UI sees exactly what `--resume` would replay.
 
+### Mobile tool-call gating (PreToolUse interception, Claude only)
+
+Mobile chat intercepts Claude's tool calls via the PreToolUse hook. By default the gating is **off** (auto-allow): tool calls flow through unchanged, but the phone gets an informational `tool_call` bubble showing what Claude ran. This preserves the `bypassPermissions` daily workflow. Copilot has no hook system, so this feature is Claude-only — server-side the gating only fires when `s.agentType === 'claude'`.
+
+The phone has a topbar mode toggle that cycles `auto` → `pause-next` → `always-pause`:
+
+- **`pause-next`** — the next single tool call broadcasts a pending bubble with Allow / Deny + optional reason; once answered the mode reverts to auto.
+- **`always-pause`** — every tool call pauses for phone approval until the user cycles back to auto.
+
+Server-side, `src/server/hook-pending.ts` maintains a per-`(sessionId, toolCallId)` map of suspended `Promise`s. `POST /api/hook` for PreToolUse calls `requestVerdict()` with a 55s timeout; the WS `toolDecision` handler calls `resolveVerdict()`. The Claude hook script (`~/.claude-maestro/hook.mjs`, written by `src/server/agents/claude.ts > ensureClaudeHookFiles`) branches on event type — PreToolUse blocks on the HTTP response, all other events stay fire-and-forget. The script translates the verdict into Claude's `permissionDecision` JSON. Timeout falls through to allow, matching the bypass-mode default. Claude's per-hook `timeout: 75` is set on PreToolUse so Claude's own timer doesn't pre-empt the 65s blocking budget.
+
+Mode is stored per WS subscriber (`WeakMap<WebSocket, ChatMode>`), so closing the mobile tab resets it. With chat-attach exclusivity, only one subscriber's mode is ever in effect at a time. On chat-WS close, `clearVerdictsForSession` releases any in-flight wait so Claude isn't blocked until the 55s timeout fires.
+
+**Synthetic bubble persistence**: tool_call bubbles aren't in the JSONL transcript, so the server keeps them in `s.syntheticBubbles` (per-session `Map`, keyed by toolCallId) and persists them under `~/.claude-maestro/bubbles/<sessionId>.jsonl` (append-only, collapsed by toolCallId on load). On chat reconnect, the server merges JSONL transcript history with synthetic bubbles, sorted by `ts`, so the conversation reads chronologically.
+
+**Per-tool rendering**: `chat.ts > renderToolSummary()` dispatches on `toolName` for Bash / Read / Write / Edit / Glob / Grep / TodoWrite / AskUserQuestion with bespoke compact layouts; unknown tools fall through to a JSON pretty-print. Add a `case` when a new tool deserves a custom view.
+
+**AskUserQuestion bridging**: `AskUserQuestion` is intercepted unconditionally when a chat subscriber is attached, regardless of the pause mode. The phone gets a bubble with option buttons (or a free-text override); choosing an option sends `toolDecision` with `decision='deny'` and `reason='User answered AskUserQuestion — ...'`. The server forces deny+reason in this path, so Claude reads the user's selection as feedback in the `permissionDecisionReason` field and adapts. The actual `AskUserQuestion` tool never runs to its TUI menu — preventing a race between the phone answer and a desktop user selecting in the terminal. If no chat subscriber is present, the tool runs normally and the desktop TUI handles it.
+
 ### Shared client code (`src/client-shared/`)
 
 Both the desktop client (`src/client/`) and the mobile client (`src/client-mobile/`)

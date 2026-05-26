@@ -89,10 +89,15 @@ function writeIfChanged(filePath: string, contents: string): boolean {
 export function ensureClaudeHookFiles(): void {
   try {
     fs.mkdirSync(STORE_DIR, { recursive: true });
-    // Cross-platform hook: tiny Node script. Reads JSON from stdin, fires a
-    // POST to the maestro server, exits immediately. No shell dependency.
+    // Cross-platform hook script. Two paths:
+    //   PreToolUse  — blocks on maestro for a verdict (up to ~65s), then
+    //                 writes Claude's expected hookSpecificOutput JSON to
+    //                 stdout and exits 0. The verdict body shape is
+    //                 { decision: 'allow'|'deny', reason?: string, timedOut?: boolean }.
+    //   everything  — fire-and-forget; POSTs and exits, 2s ceiling.
     const script = `import http from 'node:http';
 const event = process.argv[2] ?? '';
+const isBlocking = event === 'PreToolUse';
 let body = '';
 process.stdin.on('data', (c) => { body += c; });
 process.stdin.on('end', () => {
@@ -103,24 +108,65 @@ process.stdin.on('end', () => {
       'content-length': Buffer.byteLength(body),
       'x-maestro-event': event,
     },
-    timeout: 2000,
+    timeout: isBlocking ? 65000 : 2000,
   });
-  req.on('error', () => process.exit(0));
-  req.on('response', () => process.exit(0));
-  req.on('timeout', () => { req.destroy(); process.exit(0); });
+  if (!isBlocking) {
+    req.on('error', () => process.exit(0));
+    req.on('response', () => process.exit(0));
+    req.on('timeout', () => { req.destroy(); process.exit(0); });
+    req.end(body);
+    return;
+  }
+  req.on('error', () => { writeAllow('hook transport error'); process.exit(0); });
+  req.on('timeout', () => { req.destroy(); writeAllow('hook timeout'); process.exit(0); });
+  req.on('response', (res) => {
+    let raw = '';
+    res.setEncoding('utf8');
+    res.on('data', (c) => { raw += c; });
+    res.on('end', () => {
+      let verdict;
+      try { verdict = JSON.parse(raw); } catch { writeAllow('hook reply unparseable'); process.exit(0); return; }
+      const out = {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: verdict && verdict.decision === 'deny' ? 'deny' : 'allow',
+          permissionDecisionReason:
+            (verdict && verdict.reason) ||
+            (verdict && verdict.timedOut ? 'no answer from mobile chat — auto-allowed' : 'auto-allowed'),
+        },
+      };
+      process.stdout.write(JSON.stringify(out));
+      process.exit(0);
+    });
+  });
   req.end(body);
 });
 process.stdin.on('error', () => process.exit(0));
+
+function writeAllow(reason) {
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow',
+      permissionDecisionReason: reason,
+    },
+  }));
+}
 `;
     const scriptChanged = writeIfChanged(HOOK_SCRIPT, script);
     if (scriptChanged && process.platform !== 'win32') fs.chmodSync(HOOK_SCRIPT, 0o755);
     const command = `${quote(shellPath(NODE_BIN))} ${quote(shellPath(HOOK_SCRIPT))}`;
+    // PreToolUse can block on a phone verdict for up to ~60s; give Claude's
+    // per-hook timeout a matching budget. Others stay on the implicit default.
     const settings = {
       hooks: Object.fromEntries(
-        Object.keys(HOOK_ACTIVITY).map((event) => [
-          event,
-          [{ hooks: [{ type: 'command', command: `${command} ${event}` }] }],
-        ]),
+        Object.keys(HOOK_ACTIVITY).map((event) => {
+          const entry: { hooks: Array<{ type: 'command'; command: string; timeout?: number }> } = {
+            hooks: [{ type: 'command', command: `${command} ${event}` }],
+          };
+          if (event === 'PreToolUse') entry.hooks[0]!.timeout = 75;
+          return [event, [entry]];
+        }),
       ),
     };
     writeIfChanged(HOOK_SETTINGS, JSON.stringify(settings, null, 2));

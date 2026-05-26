@@ -12,16 +12,24 @@ import { debug } from './debug.js';
 import type {
   AgentType,
   ChatMessage,
+  ChatMode,
   ClientMessage,
   ServerMessage,
   SessionInfo,
   SessionActivity,
   CreateSessionBody,
+  ToolCallStatus,
 } from '../shared/protocol.js';
-import { AGENT_TYPES } from '../shared/protocol.js';
+import { AGENT_TYPES, ASK_UQ_ANSWER_PREFIX } from '../shared/protocol.js';
 import { getStrategy, type AgentReader, type SpawnTarget } from './agents/index.js';
 import { initAgentEnvironments } from './agents/all.js';
 import { COPILOT_LAUNCH_MODE } from './agents/copilot.js';
+import {
+  requestVerdict,
+  resolveVerdict,
+  clearVerdictsForSession,
+  type ToolVerdict,
+} from './hook-pending.js';
 
 function isAgentType(x: unknown): x is AgentType {
   return typeof x === 'string' && (AGENT_TYPES as readonly string[]).includes(x);
@@ -34,6 +42,7 @@ const STORE_DIR =
   path.join(os.homedir(), '.claude-maestro');
 const STORE_FILE = path.join(STORE_DIR, 'sessions.json');
 const SCROLLBACK_DIR = path.join(STORE_DIR, 'scrollback');
+const BUBBLES_DIR = path.join(STORE_DIR, 'bubbles');
 const SCROLLBACK_FLUSH_DEBOUNCE_MS = 2_000;
 /** Opt-out for users who don't want PTY bytes (which may include tokens,
  *  paths, etc.) cached on disk across maestro restarts. When set, the
@@ -93,10 +102,48 @@ interface Session extends PersistedSession {
    *  used both to derive activity (claude via hook poke / copilot via file
    *  tailing) and to serve chat history on `attachChat`. */
   reader: AgentReader | null;
+  /** In-memory ring of synthetic ChatMessages (currently `tool_call` bubbles)
+   *  the server fabricated that the JSONL transcript doesn't contain. Used to
+   *  replay them when a chat client reconnects. Keyed by toolCallId so status
+   *  updates replace rather than stack. Capped at 500. */
+  syntheticBubbles: Map<string, ChatMessage>;
   activity: SessionActivity;
 }
 
 const sessions = new Map<string, Session>();
+
+// ───────── chat mode (per-WS-subscriber) ─────────
+//
+// Each chat WS subscriber carries a mode controlling whether PreToolUse hooks
+// broadcast a pending bubble and await a phone verdict, or just auto-allow.
+// Stored as a WeakMap so closing the socket auto-cleans the entry. With
+// chat-attach exclusivity, only one subscriber's mode is ever in effect.
+const chatModes = new WeakMap<WebSocket, ChatMode>();
+
+function getChatMode(ws: WebSocket): ChatMode {
+  return chatModes.get(ws) ?? 'auto';
+}
+function setChatMode(ws: WebSocket, m: ChatMode) {
+  chatModes.set(ws, m);
+}
+function effectiveSessionMode(s: Session): ChatMode {
+  let best: ChatMode = 'auto';
+  for (const ws of s.chatSubscribers) {
+    const m = getChatMode(ws);
+    if (m === 'always-pause') return 'always-pause';
+    if (m === 'pause-next') best = 'pause-next';
+  }
+  return best;
+}
+function consumePauseNext(s: Session) {
+  for (const ws of s.chatSubscribers) {
+    if (getChatMode(ws) === 'pause-next') {
+      setChatMode(ws, 'auto');
+      const echo: ServerMessage = { type: 'chatMode', mode: 'auto' };
+      try { ws.send(JSON.stringify(echo)); } catch {}
+    }
+  }
+}
 
 // ───────── persistence ─────────
 
@@ -162,6 +209,7 @@ function loadPersisted() {
       subscribers: new Set(),
       chatSubscribers: new Set(),
       reader: null,
+      syntheticBubbles: loadBubbles(p.id),
       activity: 'unknown',
     });
   }
@@ -299,6 +347,66 @@ function broadcastChat(s: Session, msg: ServerMessage) {
   for (const ws of s.chatSubscribers) {
     if (ws.readyState === ws.OPEN) ws.send(payload);
   }
+}
+
+// ───────── synthetic tool_call bubbles ─────────
+//
+// PreToolUse-derived bubbles aren't in the JSONL transcript, so we persist
+// them per-session as append-only JSONL under STORE_DIR/bubbles/<id>.jsonl.
+// Load collapses by toolCallId (latest write wins) so pending → answered
+// status flips just append another line.
+
+function bubblesPath(sessionId: string): string {
+  return path.join(BUBBLES_DIR, `${sessionId}.jsonl`);
+}
+function appendBubble(sessionId: string, m: ChatMessage) {
+  try {
+    fs.mkdirSync(BUBBLES_DIR, { recursive: true });
+    fs.appendFileSync(bubblesPath(sessionId), JSON.stringify(m) + '\n');
+  } catch (err) {
+    console.error('[maestro] bubble persist failed:', (err as Error).message);
+  }
+}
+function loadBubbles(sessionId: string): Map<string, ChatMessage> {
+  const out = new Map<string, ChatMessage>();
+  const p = bubblesPath(sessionId);
+  if (!fs.existsSync(p)) return out;
+  let raw: string;
+  try {
+    raw = fs.readFileSync(p, 'utf8');
+  } catch {
+    return out;
+  }
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed: ChatMessage;
+    try {
+      parsed = JSON.parse(trimmed) as ChatMessage;
+    } catch {
+      continue;
+    }
+    if (parsed && parsed.type === 'tool_call') {
+      out.set(parsed.toolCallId, parsed);
+    }
+  }
+  return out;
+}
+function deleteBubbleFile(sessionId: string) {
+  try { fs.rmSync(bubblesPath(sessionId), { force: true }); } catch {}
+}
+
+/** Broadcast a tool_call bubble AND remember it on the session so a
+ *  reconnecting chat client can replay it. Status updates replace prior
+ *  entries with the same toolCallId. */
+function broadcastToolCall(s: Session, m: Extract<ChatMessage, { type: 'tool_call' }>) {
+  s.syntheticBubbles.set(m.toolCallId, m);
+  if (s.syntheticBubbles.size > 500) {
+    const firstKey = s.syntheticBubbles.keys().next().value as string | undefined;
+    if (firstKey !== undefined) s.syntheticBubbles.delete(firstKey);
+  }
+  appendBubble(s.id, m);
+  broadcastChat(s, { type: 'chatMessage', message: m });
 }
 
 function resizeSession(s: Session, cols: number, rows: number) {
@@ -512,6 +620,7 @@ function createSession(body: CreateSessionBody): Session {
     subscribers: new Set(),
     chatSubscribers: new Set(),
     reader: null,
+    syntheticBubbles: new Map(),
     activity: 'unknown',
   };
   sessions.set(id, s);
@@ -548,6 +657,7 @@ function killSession(id: string): boolean {
   sessions.delete(id);
   persist();
   deleteScrollback(id);
+  deleteBubbleFile(id);
   // Note: leaves the agent's on-disk transcript intact (Claude's
   // ~/.claude/projects/<slug>/<uuid>.jsonl or Copilot's
   // ~/.copilot/session-state/<uuid>/events.jsonl) so the user can still
@@ -641,7 +751,7 @@ app.delete('/api/sessions/:id', (req, res) => {
 // always contains `session_id`. The strategy decides what each event means
 // for activity / chat — Copilot doesn't have hooks at all and its strategy
 // returns null.
-app.post('/api/hook', (req, res) => {
+app.post('/api/hook', async (req, res) => {
   const event = String(req.headers['x-maestro-event'] ?? '');
   const sid = (req.body?.session_id as string | undefined) ?? '';
   debug(`[hook] event=${event} session_id=${sid.slice(0, 8)}`);
@@ -655,8 +765,124 @@ app.post('/api/hook', (req, res) => {
     if (outcome?.activity) setActivity(s, outcome.activity);
     if (outcome?.flushChat) s.reader?.poke();
   }
+
+  // PreToolUse for Claude is special — the response body carries the verdict
+  // back to claude (allow/deny). Other events get a 204 immediately.
+  if (s && s.agentType === 'claude' && event === 'PreToolUse') {
+    const verdict = await handlePreToolUse(s, req.body ?? {});
+    res.json(verdict);
+    return;
+  }
   res.status(204).end();
 });
+
+/** Bridge a PreToolUse hook through the mobile chat (if any). Always
+ *  resolves with a verdict the hook script can serialize as
+ *  `permissionDecision: 'allow' | 'deny'`. */
+async function handlePreToolUse(
+  s: Session,
+  body: Record<string, unknown>,
+): Promise<ToolVerdict> {
+  const toolName = String(body.tool_name ?? 'unknown');
+  const toolInput = body.tool_input ?? {};
+  const toolCallId =
+    (body.tool_use_id as string | undefined) ?? crypto.randomUUID();
+  const ts = Date.now();
+
+  const mode = effectiveSessionMode(s);
+
+  // AskUserQuestion: always intercept when a chat client is attached, even in
+  // auto mode — otherwise the desktop TUI menu grabs the answer and the phone
+  // sees a spurious result. Translates chosen option to deny+reason so Claude
+  // reads it as user feedback. If no chat subscriber is present, fall through
+  // to allow so desktop TUI handles it normally.
+  const isAskUQ = toolName === 'AskUserQuestion';
+  const forcePause = isAskUQ && s.chatSubscribers.size > 0;
+
+  if (mode === 'auto' && !forcePause) {
+    if (s.chatSubscribers.size > 0) {
+      broadcastToolCall(s, {
+        type: 'tool_call',
+        toolCallId,
+        toolName,
+        toolInput,
+        status: 'allowed',
+        ts,
+      });
+    } else {
+      // No subscriber: remember the bubble so a later chat attach replays it.
+      const bubble: Extract<ChatMessage, { type: 'tool_call' }> = {
+        type: 'tool_call',
+        toolCallId,
+        toolName,
+        toolInput,
+        status: 'allowed',
+        ts,
+      };
+      s.syntheticBubbles.set(toolCallId, bubble);
+      appendBubble(s.id, bubble);
+    }
+    return { decision: 'allow' };
+  }
+
+  broadcastToolCall(s, {
+    type: 'tool_call',
+    toolCallId,
+    toolName,
+    toolInput,
+    status: 'pending',
+    ts,
+  });
+  debug(`[hook] PreToolUse ${s.id.slice(0, 8)} ${toolName} — awaiting verdict (mode=${mode}${forcePause ? ', force-pause' : ''})`);
+  const verdict = await requestVerdict(s.id, toolCallId, 55_000);
+  debug(`[hook] PreToolUse ${s.id.slice(0, 8)} ${toolName} → ${verdict.decision}${verdict.timedOut ? ' (timeout)' : ''}`);
+
+  // AskUserQuestion bridge: convert verdict to deny+reason so Claude reads
+  // it as user feedback. On timeout, deny with a "no answer" reason so Claude
+  // moves on rather than auto-allowing into a broken TUI flow.
+  let effectiveVerdict: ToolVerdict = verdict;
+  if (isAskUQ) {
+    effectiveVerdict = {
+      decision: 'deny',
+      reason: verdict.reason ?? (verdict.timedOut ? 'no answer from mobile user' : 'no selection'),
+      timedOut: verdict.timedOut,
+    };
+  }
+
+  let status: ToolCallStatus;
+  let displayReason = effectiveVerdict.reason;
+  if (isAskUQ) {
+    if (effectiveVerdict.timedOut) {
+      status = 'timedout';
+    } else {
+      status = 'answered';
+      if (displayReason && displayReason.startsWith(ASK_UQ_ANSWER_PREFIX)) {
+        displayReason = displayReason.slice(ASK_UQ_ANSWER_PREFIX.length);
+      }
+    }
+  } else {
+    status = effectiveVerdict.timedOut
+      ? 'timedout'
+      : effectiveVerdict.decision === 'deny'
+        ? 'denied'
+        : 'allowed';
+  }
+  broadcastToolCall(s, {
+    type: 'tool_call',
+    toolCallId,
+    toolName,
+    toolInput,
+    status,
+    denyReason: displayReason,
+    ts: Date.now(),
+  });
+
+  // pause-next is one-shot. AskUQ bridging doesn't consume it (the pause was
+  // forced for this tool regardless of mode).
+  if (!isAskUQ) consumePauseNext(s);
+
+  return effectiveVerdict;
+}
 
 // ───────── filesystem completion ─────────
 
@@ -1001,11 +1227,17 @@ function attach(ws: WebSocket, sessionId: string) {
         return;
       }
       attached = true;
-      const history: ChatMessage[] = s.reader.readAll();
+      setChatMode(ws, 'auto');
+      // Merge JSONL transcript entries with in-memory synthetic tool_call
+      // bubbles, sorted by ts so the conversation reads chronologically.
+      const transcript = s.reader.readAll();
+      const synthetic = [...s.syntheticBubbles.values()];
+      const history: ChatMessage[] = [...transcript, ...synthetic].sort((a, b) => a.ts - b.ts);
       const reply: ServerMessage = {
         type: 'chatAttached',
         session: toInfo(s),
         history,
+        mode: 'auto',
       };
       ws.send(JSON.stringify(reply));
       if (!s.alive && s.exitCode !== null) {
@@ -1027,12 +1259,28 @@ function attach(ws: WebSocket, sessionId: string) {
       // makes this moot, but keep the guard for when exclusivity loosens.
       if (mode === 'chat') return;
       resizeSession(s, msg.cols, msg.rows);
+    } else if (msg.type === 'setChatMode') {
+      if (mode !== 'chat') return;
+      setChatMode(ws, msg.mode);
+      ws.send(JSON.stringify({ type: 'chatMode', mode: msg.mode } satisfies ServerMessage));
+      debug(`[chat] ${s.id.slice(0, 8)} mode → ${msg.mode}`);
+    } else if (msg.type === 'toolDecision') {
+      if (mode !== 'chat') return;
+      const ok = resolveVerdict(s.id, msg.toolCallId, {
+        decision: msg.decision,
+        reason: msg.reason,
+      });
+      debug(`[chat] ${s.id.slice(0, 8)} toolDecision ${msg.toolCallId.slice(0, 8)} ${msg.decision} (resolved=${ok})`);
     }
   });
 
   ws.on('close', () => {
+    const wasChat = s.chatSubscribers.has(ws);
     s.subscribers.delete(ws);
     s.chatSubscribers.delete(ws);
+    // Chat client disappeared mid-PreToolUse → release the wait so Claude
+    // isn't blocked until the 55s timeout fires.
+    if (wasChat) clearVerdictsForSession(s.id);
   });
 }
 

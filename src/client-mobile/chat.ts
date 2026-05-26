@@ -1,10 +1,12 @@
 import type {
   AgentType,
   ChatMessage,
+  ChatMode,
   ClientMessage,
   ServerMessage,
   SessionInfo,
 } from '../shared/protocol';
+import { ASK_UQ_ANSWER_PREFIX } from '../shared/protocol';
 import { MaestroApi } from '../client-shared/api';
 import { debug } from '../client-shared/debug';
 import type { MobileServerEntry } from './mobile-state';
@@ -74,6 +76,10 @@ export function renderChat(
     <header class="topbar">
       <button class="topbar__back" id="back" aria-label="back">‹</button>
       <span class="topbar__title" id="t-title">…</span>
+      <button class="mode-toggle" id="mode-toggle" data-mode="auto" aria-label="pause mode">
+        <span class="mode-toggle__icon">→</span>
+        <span class="mode-toggle__label">auto</span>
+      </button>
       <span class="topbar__hint" id="t-status">connecting…</span>
     </header>
     <main class="chat">
@@ -100,6 +106,7 @@ export function renderChat(
   const titleEl = root.querySelector<HTMLSpanElement>('#t-title')!;
   const inputEl = root.querySelector<HTMLTextAreaElement>('#composer')!;
   const sendBtn = root.querySelector<HTMLButtonElement>('#send')!;
+  const modeBtn = root.querySelector<HTMLButtonElement>('#mode-toggle')!;
 
   root.querySelector<HTMLButtonElement>('#back')!.addEventListener('click', () => {
     try { ws?.close(); } catch {}
@@ -155,7 +162,253 @@ export function renderChat(
     } else if (m.type === 'user_text') {
       // History replay: render user's prior message bubbles.
       addBubble({ role: 'user', text: m.text, ts: m.ts });
+    } else if (m.type === 'tool_call') {
+      applyToolCall(m);
     }
+  }
+
+  // ───────── chat mode toggle ─────────
+
+  let currentMode: ChatMode = 'auto';
+  const MODE_ORDER: ChatMode[] = ['auto', 'pause-next', 'always-pause'];
+  const MODE_LABEL: Record<ChatMode, { icon: string; text: string }> = {
+    auto: { icon: '→', text: 'auto' },
+    'pause-next': { icon: '⏸', text: 'pause 1' },
+    'always-pause': { icon: '⏸⏸', text: 'pause all' },
+  };
+  function applyMode(m: ChatMode) {
+    currentMode = m;
+    modeBtn.dataset.mode = m;
+    const iconEl = modeBtn.querySelector('.mode-toggle__icon');
+    const labelEl = modeBtn.querySelector('.mode-toggle__label');
+    if (iconEl) iconEl.textContent = MODE_LABEL[m].icon;
+    if (labelEl) labelEl.textContent = MODE_LABEL[m].text;
+  }
+  modeBtn.addEventListener('click', () => {
+    const next = MODE_ORDER[(MODE_ORDER.indexOf(currentMode) + 1) % MODE_ORDER.length]!;
+    applyMode(next);
+    const msg: ClientMessage = { type: 'setChatMode', mode: next };
+    try { ws?.send(JSON.stringify(msg)); } catch {}
+  });
+
+  // ───────── tool_call bubbles ─────────
+  //
+  // Keyed by toolCallId so a status-update message replaces the existing
+  // bubble in-place instead of stacking another.
+  const toolBubbles = new Map<string, HTMLElement>();
+
+  function escapeHtml(s: string): string {
+    return s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+  function formatToolInput(input: unknown): string {
+    if (input === null || input === undefined) return '';
+    if (typeof input === 'string') return input;
+    try { return JSON.stringify(input, null, 2); } catch { return String(input); }
+  }
+
+  /** Per-tool summary body. Falls back to JSON for unknown tools. */
+  function renderToolSummary(toolName: string, input: unknown): string {
+    const inp = (input ?? {}) as Record<string, unknown>;
+    const code = (s: string) => `<code>${escapeHtml(s)}</code>`;
+    const pre = (s: string) => `<pre class="bubble__tool-params">${escapeHtml(s)}</pre>`;
+    const trunc = (s: string, n = 600) => (s.length > n ? s.slice(0, n) + '…' : s);
+
+    switch (toolName) {
+      case 'Bash': {
+        const cmd = String(inp.command ?? '');
+        const desc = inp.description ? String(inp.description) : '';
+        return `${desc ? `<p class="bubble__tool-desc">${escapeHtml(desc)}</p>` : ''}${pre(trunc(cmd, 1200))}`;
+      }
+      case 'Read': {
+        const p = String(inp.file_path ?? '');
+        const offset = inp.offset != null ? `, offset=${inp.offset}` : '';
+        const limit = inp.limit != null ? `, limit=${inp.limit}` : '';
+        return `<p class="bubble__tool-path">${code(p)}${escapeHtml(offset + limit)}</p>`;
+      }
+      case 'Write': {
+        const p = String(inp.file_path ?? '');
+        const content = String(inp.content ?? '');
+        const sizeKb = (content.length / 1024).toFixed(1);
+        return `<p class="bubble__tool-path">${code(p)} <small>(${sizeKb} KB)</small></p>${pre(trunc(content))}`;
+      }
+      case 'Edit': {
+        const p = String(inp.file_path ?? '');
+        const oldS = String(inp.old_string ?? '');
+        const newS = String(inp.new_string ?? '');
+        return `<p class="bubble__tool-path">${code(p)}</p>
+          <p class="bubble__tool-diff-label">- old:</p>${pre(trunc(oldS, 400))}
+          <p class="bubble__tool-diff-label">+ new:</p>${pre(trunc(newS, 400))}`;
+      }
+      case 'Glob': {
+        const pattern = String(inp.pattern ?? '');
+        const path = inp.path ? ` in ${code(String(inp.path))}` : '';
+        return `<p>${code(pattern)}${path}</p>`;
+      }
+      case 'Grep': {
+        const pattern = String(inp.pattern ?? '');
+        const path = inp.path ? ` in ${code(String(inp.path))}` : '';
+        const glob = inp.glob ? ` (glob ${code(String(inp.glob))})` : '';
+        return `<p>${code(pattern)}${path}${glob}</p>`;
+      }
+      case 'TodoWrite': {
+        const todos = Array.isArray(inp.todos) ? (inp.todos as Array<Record<string, unknown>>) : [];
+        if (todos.length === 0) return '<p><em>empty todo list</em></p>';
+        const items = todos.map((t) => {
+          const status = String(t.status ?? '');
+          const icon = status === 'completed' ? '✓' : status === 'in_progress' ? '→' : '·';
+          return `<li>${escapeHtml(icon)} ${escapeHtml(String(t.content ?? ''))}</li>`;
+        }).join('');
+        return `<ul class="bubble__tool-todos">${items}</ul>`;
+      }
+      case 'AskUserQuestion': {
+        const questions = Array.isArray(inp.questions) ? (inp.questions as Array<Record<string, unknown>>) : [];
+        if (questions.length === 0) return '<p><em>(no questions)</em></p>';
+        return questions.map((q) => {
+          const text = escapeHtml(String(q.question ?? ''));
+          const header = q.header ? `<span class="bubble__tool-qheader">${escapeHtml(String(q.header))}</span>` : '';
+          return `<p class="bubble__tool-question">${header}${text}</p>`;
+        }).join('');
+      }
+      default:
+        return pre(formatToolInput(input));
+    }
+  }
+
+  function renderToolBubble(li: HTMLElement, m: Extract<ChatMessage, { type: 'tool_call' }>) {
+    li.className = `bubble bubble--tool bubble--tool-${m.status}`;
+    const summary = renderToolSummary(m.toolName, m.toolInput);
+    li.innerHTML = `
+      <div class="bubble__tool-head">
+        <span class="bubble__tool-name">${escapeHtml(m.toolName)}</span>
+        <span class="bubble__tool-status">${m.status}</span>
+      </div>
+      <div class="bubble__tool-summary">${summary}</div>
+    `;
+    if (m.toolName === 'AskUserQuestion' && m.status === 'pending') {
+      attachAskUserQuestionUI(li, m);
+      return;
+    }
+    if (m.status === 'pending') {
+      const actions = document.createElement('div');
+      actions.className = 'bubble__tool-actions';
+      const allowBtn = document.createElement('button');
+      allowBtn.className = 'btn btn--allow';
+      allowBtn.textContent = 'allow';
+      const denyBtn = document.createElement('button');
+      denyBtn.className = 'btn btn--deny';
+      denyBtn.textContent = 'deny';
+      const reasonEl = document.createElement('input');
+      reasonEl.className = 'bubble__tool-deny-reason';
+      reasonEl.placeholder = 'reason (optional)';
+      reasonEl.type = 'text';
+      actions.append(allowBtn, denyBtn, reasonEl);
+      li.appendChild(actions);
+      const decide = (decision: 'allow' | 'deny') => {
+        const reason = decision === 'deny' ? reasonEl.value.trim() || undefined : undefined;
+        const msg: ClientMessage = { type: 'toolDecision', toolCallId: m.toolCallId, decision, reason };
+        try { ws?.send(JSON.stringify(msg)); } catch {}
+        allowBtn.disabled = true;
+        denyBtn.disabled = true;
+        reasonEl.disabled = true;
+      };
+      allowBtn.addEventListener('click', () => decide('allow'));
+      denyBtn.addEventListener('click', () => decide('deny'));
+    }
+    if (m.status === 'denied' && m.denyReason) {
+      const reasonNote = document.createElement('p');
+      reasonNote.className = 'bubble__tool-reason';
+      reasonNote.textContent = m.denyReason;
+      li.appendChild(reasonNote);
+    }
+    if (m.status === 'answered' && m.denyReason) {
+      const ans = document.createElement('p');
+      ans.className = 'bubble__askuq-answer';
+      ans.textContent = m.denyReason;
+      li.appendChild(ans);
+    }
+  }
+
+  /** AskUserQuestion option picker. Sends a `toolDecision` with deny+reason
+   *  prefixed by ASK_UQ_ANSWER_PREFIX — the server uses that as the signal to
+   *  translate it back to Claude as user feedback. */
+  function attachAskUserQuestionUI(li: HTMLElement, m: Extract<ChatMessage, { type: 'tool_call' }>) {
+    const inp = (m.toolInput ?? {}) as Record<string, unknown>;
+    const questions = Array.isArray(inp.questions) ? (inp.questions as Array<Record<string, unknown>>) : [];
+    const wrap = document.createElement('div');
+    wrap.className = 'bubble__askuq';
+
+    const answers: Array<string | null> = questions.map(() => null);
+    const customInputs: HTMLInputElement[] = [];
+
+    const finish = () => {
+      const parts: string[] = [];
+      for (let i = 0; i < questions.length; i++) {
+        const q = questions[i] as Record<string, unknown>;
+        const qHeader = q.header ? String(q.header) : `Q${i + 1}`;
+        const ans = answers[i];
+        const custom = customInputs[i]?.value.trim();
+        if (custom) parts.push(`${qHeader}: ${custom}`);
+        else if (ans) parts.push(`${qHeader}: ${ans}`);
+        else parts.push(`${qHeader}: (no answer)`);
+      }
+      const reason = `${ASK_UQ_ANSWER_PREFIX}${parts.join(' | ')}`;
+      const msg: ClientMessage = { type: 'toolDecision', toolCallId: m.toolCallId, decision: 'deny', reason };
+      try { ws?.send(JSON.stringify(msg)); } catch {}
+      wrap.querySelectorAll<HTMLButtonElement>('button').forEach((b) => (b.disabled = true));
+      wrap.querySelectorAll<HTMLInputElement>('input').forEach((i) => (i.disabled = true));
+    };
+
+    questions.forEach((q, qi) => {
+      const opts = Array.isArray(q.options) ? (q.options as Array<Record<string, unknown>>) : [];
+      const optWrap = document.createElement('div');
+      optWrap.className = 'bubble__askuq-options';
+      opts.forEach((opt) => {
+        const label = String(opt.label ?? '');
+        const desc = opt.description ? String(opt.description) : '';
+        const btn = document.createElement('button');
+        btn.className = 'btn bubble__askuq-option';
+        btn.innerHTML = `<span class="bubble__askuq-label">${escapeHtml(label)}</span>${desc ? `<span class="bubble__askuq-desc">${escapeHtml(desc)}</span>` : ''}`;
+        btn.addEventListener('click', () => {
+          answers[qi] = label;
+          optWrap.querySelectorAll('.bubble__askuq-option').forEach((b) => b.classList.remove('is-chosen'));
+          btn.classList.add('is-chosen');
+        });
+        optWrap.appendChild(btn);
+      });
+      const custom = document.createElement('input');
+      custom.className = 'bubble__askuq-custom';
+      custom.type = 'text';
+      custom.placeholder = 'or type your own answer…';
+      customInputs.push(custom);
+      optWrap.appendChild(custom);
+      wrap.appendChild(optWrap);
+    });
+
+    const submit = document.createElement('button');
+    submit.className = 'btn btn--allow bubble__askuq-submit';
+    submit.textContent = 'send answer';
+    submit.addEventListener('click', finish);
+    wrap.appendChild(submit);
+
+    li.appendChild(wrap);
+  }
+
+  function applyToolCall(m: Extract<ChatMessage, { type: 'tool_call' }>) {
+    let li = toolBubbles.get(m.toolCallId);
+    if (!li) {
+      li = document.createElement('li');
+      toolBubbles.set(m.toolCallId, li);
+      bubblesEl.appendChild(li);
+    }
+    renderToolBubble(li, m);
+    requestAnimationFrame(() => {
+      bubblesEl.scrollTop = bubblesEl.scrollHeight;
+    });
   }
 
   /** Live chatMessage frames may echo a user_text we just sent (transcript
@@ -264,6 +517,7 @@ export function renderChat(
       agentType = msg.session.agentType ?? 'claude';
       titleEl.textContent = msg.session.title;
       setStatus(sessionStatusLabel(msg.session));
+      applyMode(msg.mode);
       for (const m of msg.history) applyAssistantMessage(m);
       // Treat any prior history as a signal that input is ok. If there is no
       // history, also unlock — the agent is initializing but we accept queued
@@ -271,9 +525,17 @@ export function renderChat(
       unlockInput();
       return;
     }
+    if (msg.type === 'chatMode') {
+      applyMode(msg.mode);
+      return;
+    }
     if (msg.type === 'chatMessage') {
       onLiveChatMessage(msg.message);
-      unlockInput();
+      // Tool_call status updates shouldn't toggle the lock — Claude isn't
+      // necessarily done thinking. Only text replies unlock.
+      if (msg.message.type === 'assistant_text' || msg.message.type === 'user_text') {
+        unlockInput();
+      }
       return;
     }
     if (msg.type === 'activity') {

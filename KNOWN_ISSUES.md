@@ -70,11 +70,12 @@ Agency mode is now a first-class Copilot launch mode (see CLAUDE.md → "Copilot
 
 ## Mobile chat frontend (`/m`)
 
-### Permission prompts freeze the chat (MVP)
+### TUI-only interactive states remain unbridged
 
-- **Symptom:** When Claude requests a tool whose use is not pre-allowed (e.g. `Bash`, `Write`), it emits an interactive permission prompt to the TUI. The mobile chat client renders nothing for this — the chat appears to hang, and the user cannot answer the prompt from the phone.
-- **Root cause:** The mobile UI's only source of structured data is Claude's JSONL transcript file. The transcript records the *outcome* of permission decisions but not the interactive prompt itself, so there is nothing to render or respond to from the phone.
-- **Workaround:** Pre-allow common tools in the target repo's `.claude/settings.json` (`permissions.allow`) so Claude does not need to prompt. For full interactivity, attach a desktop terminal client to the same session (after closing the mobile tab, since chat mode is exclusive) to clear the prompt.
+- **Symptom:** Some interactive Claude Code prompts don't surface on the mobile chat UI. Examples: slash command picker (e.g. typing `/` on desktop opens an arrow-key menu), `--continue` confirmations, login flows.
+- **Root cause:** These flows live only in the TUI byte stream — Claude does not write them to the JSONL transcript, and they don't go through the PreToolUse hook either. The mobile client only sees JSONL-derived bubbles and hook-derived tool_call bubbles, so it has no signal for them.
+- **Status:** Tool-use permission prompts are **resolved** — the maestro PreToolUse hook bridges them to phone-side Allow/Deny bubbles (off by default; toggleable in the mobile topbar). Slash menus / continue prompts remain TUI-only.
+- **Workaround:** For sessions whose workflows need those interactions, use the desktop terminal client. The mobile chat-attach is exclusive, so you'll need to close the mobile tab first.
 
 ### Mobile chat mode is exclusive — only one client per session
 

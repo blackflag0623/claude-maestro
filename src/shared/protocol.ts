@@ -48,21 +48,47 @@ export interface CreateSessionBody {
   agentType?: AgentType;
 }
 
+export type ChatMode = 'auto' | 'pause-next' | 'always-pause';
+
 export type ClientMessage =
   | { type: 'attach'; cols: number; rows: number }
   | { type: 'attachChat'; cols: number; rows: number }
   | { type: 'input'; data: string }
-  | { type: 'resize'; cols: number; rows: number };
+  | { type: 'resize'; cols: number; rows: number }
+  | { type: 'setChatMode'; mode: ChatMode }
+  | { type: 'toolDecision'; toolCallId: string; decision: 'allow' | 'deny'; reason?: string };
 
-/** Structured chat message extracted from an agent's on-disk transcript.
- *  `assistant_text` = an assistant turn's rendered text content.
- *  `user_text`      = a user prompt's text content (history replay only — live
- *                     user inputs are rendered locally on send to avoid
- *                     double-displaying when the transcript flush echoes them
- *                     back). */
+/** Status lifecycle for a `tool_call` bubble. `pending` is shown while the
+ *  phone is awaiting Allow/Deny; resolves to `allowed` / `denied` / `timedout`.
+ *  `answered` is the AskUserQuestion bridge's terminal state. */
+export type ToolCallStatus = 'pending' | 'allowed' | 'denied' | 'timedout' | 'answered';
+
+/** Prefix used when the mobile client translates an AskUserQuestion answer
+ *  into a `toolDecision` reason. The server strips this prefix before
+ *  rendering the bubble's clean "answer" view but forwards the full
+ *  prefixed string to Claude as `permissionDecisionReason`, so Claude reads
+ *  it as user feedback. Both ends must use the exact same string. */
+export const ASK_UQ_ANSWER_PREFIX = 'User answered AskUserQuestion — ';
+
+/** Structured chat message extracted from an agent's on-disk transcript or
+ *  fabricated by the server.
+ *  `assistant_text` / `user_text` come from the transcript file.
+ *  `tool_call`      = synthetic bubble for a Claude tool invocation. Status
+ *                     starts as `pending` when paused waiting for the phone;
+ *                     flips to `allowed`/`denied`/`timedout`/`answered`. In
+ *                     auto mode, the bubble is emitted as `allowed` directly. */
 export type ChatMessage =
   | { type: 'assistant_text'; text: string; ts: number }
-  | { type: 'user_text'; text: string; ts: number };
+  | { type: 'user_text'; text: string; ts: number }
+  | {
+      type: 'tool_call';
+      toolCallId: string;
+      toolName: string;
+      toolInput: unknown;
+      status: ToolCallStatus;
+      denyReason?: string;
+      ts: number;
+    };
 
 export interface FsListEntry {
   name: string;
@@ -84,8 +110,9 @@ export type FsReadResponse =
 
 export type ServerMessage =
   | { type: 'attached'; session: SessionInfo; scrollback: string }
-  | { type: 'chatAttached'; session: SessionInfo; history: ChatMessage[] }
+  | { type: 'chatAttached'; session: SessionInfo; history: ChatMessage[]; mode: ChatMode }
   | { type: 'chatMessage'; message: ChatMessage }
+  | { type: 'chatMode'; mode: ChatMode }
   | { type: 'output'; data: string }
   | { type: 'activity'; activity: SessionActivity }
   | { type: 'exit'; code: number | null }
