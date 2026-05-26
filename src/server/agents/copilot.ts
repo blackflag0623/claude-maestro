@@ -64,12 +64,19 @@ import type {
 import type { ChatMessage, SessionActivity } from '../../shared/protocol.js';
 import { debug } from '../debug.js';
 
-// ───────── binary resolution ─────────
+// ───────── binary resolution & launch-mode detection ─────────
 
-const COPILOT_BIN_RAW = (process.env.MAESTRO_COPILOT_BIN ?? 'copilot').trim() || 'copilot';
-const COPILOT_PREFIX_ARGS = (process.env.MAESTRO_COPILOT_PREFIX_ARGS ?? '')
+const RAW_BIN_ENV = process.env.MAESTRO_COPILOT_BIN;
+const USER_SET_BIN = RAW_BIN_ENV !== undefined && RAW_BIN_ENV.trim() !== '';
+const RAW_BIN_REQUESTED = (RAW_BIN_ENV ?? 'copilot').trim() || 'copilot';
+
+const USER_PREFIX_ARGS = (process.env.MAESTRO_COPILOT_PREFIX_ARGS ?? '')
   .split(/\s+/)
   .filter(Boolean);
+
+const RAW_AGENCY_ENV = process.env.MAESTRO_COPILOT_AGENCY;
+const AGENCY_EXPLICITLY_ENABLED = RAW_AGENCY_ENV === '1';
+const AGENCY_EXPLICITLY_DISABLED = RAW_AGENCY_ENV === '0';
 
 interface ResolvedBin {
   /** The path that will be passed to pty.spawn. Either the literal name (if
@@ -109,72 +116,126 @@ function resolveBin(name: string): ResolvedBin {
   return { path: name, found: false, searched: dirs };
 }
 
-const COPILOT_BIN_INFO = resolveBin(COPILOT_BIN_RAW);
-const COPILOT_BIN = COPILOT_BIN_INFO.path;
-
-/** True iff `agency` exists on PATH — used to steer users on Microsoft
- *  devboxes toward agency launch mode when `copilot` isn't directly on PATH.
- *  Resolved once at module load; intentionally cheap (no spawn). */
-const AGENCY_ON_PATH = resolveBin('agency').found;
-
-if (!COPILOT_BIN_INFO.found) {
-  // Surface immediately at startup so the operator sees it before the first
-  // user attempts a Copilot session and hits the (less helpful) spawn-time
-  // failure on the wire.
-  if (AGENCY_ON_PATH && COPILOT_BIN_RAW === 'copilot') {
-    console.warn(
-      `[maestro] WARNING: Copilot CLI binary "copilot" not found on PATH, but "agency" IS on PATH. ` +
-        `This looks like a Microsoft devbox. Enable agency launch mode by setting these env vars ` +
-        `before starting maestro:\n` +
-        `    MAESTRO_COPILOT_BIN=agency\n` +
-        `    MAESTRO_COPILOT_PREFIX_ARGS=copilot\n` +
-        `(or just MAESTRO_COPILOT_AGENCY=1 if you keep MAESTRO_COPILOT_BIN unset, but you still need PREFIX_ARGS=copilot). ` +
-        `See CLAUDE.md → "Copilot launch modes".`,
-    );
-  } else {
-    console.warn(
-      `[maestro] WARNING: Copilot CLI binary "${COPILOT_BIN_RAW}" not found on PATH. ` +
-        `Copilot sessions will fail to spawn until either (a) "${COPILOT_BIN_RAW}" is installed and on PATH ` +
-        `for the maestro server process, or (b) MAESTRO_COPILOT_BIN is set to an absolute path to the executable. ` +
-        `Install hint: \`npm install -g @github/copilot\` (then ensure the npm global bin dir is on PATH), ` +
-        `or on Windows install via WinGet (\`winget install GitHub.Copilot\`).`,
-    );
-  }
-}
-
-// ───────── launch mode (direct vs agency) ─────────
-
 /** Recognised launch modes. Persisted per-session as `copilotLaunchMode` so
  *  that a maestro restart in a different mode can detect the mismatch and
  *  fail-closed rather than silently start a fresh agency session against an
  *  existing direct-mode session's uuid. */
 export type CopilotLaunchMode = 'direct' | 'agency';
 
-function detectLaunchMode(): CopilotLaunchMode {
-  if (process.env.MAESTRO_COPILOT_AGENCY === '1') return 'agency';
-  const base = path.basename(COPILOT_BIN_RAW).toLowerCase();
-  // basename "agency", "agency.exe", "agency.cmd" all match. We avoid a
-  // bare `.includes('agency')` so a path like `C:\agency-tools\copilot.exe`
-  // does not get mis-detected.
-  if (base === 'agency' || base.startsWith('agency.')) return 'agency';
-  return 'direct';
+/** Resolution of binary + launch mode. All four pieces (mode, bin, prefix
+ *  args, display name) are decided together so auto-fallback can promote
+ *  `copilot` → `agency copilot` atomically. */
+interface CopilotResolution {
+  mode: CopilotLaunchMode;
+  binInfo: ResolvedBin;
+  prefixArgs: string[];
+  /** What to surface in logs/errors. For auto-fallback this is "agency"; for
+   *  explicit configs it echoes what the user set. */
+  displayBin: string;
+  /** True when maestro promoted the binary from `copilot` to `agency`
+   *  because `copilot` was missing on PATH. Used to make startup logs and
+   *  spawn errors honest about what's actually being executed. */
+  autoAgency: boolean;
 }
 
-export const COPILOT_LAUNCH_MODE: CopilotLaunchMode = detectLaunchMode();
+/** Decide which binary + launch mode to use, in priority order:
+ *
+ *  1. If the user pinned `MAESTRO_COPILOT_BIN`, honor it. Launch mode comes
+ *     from `MAESTRO_COPILOT_AGENCY` (if explicit) or the bin's basename.
+ *  2. If the user set `MAESTRO_COPILOT_AGENCY=1` explicitly, force agency
+ *     mode using whatever bin/prefix args they configured.
+ *  3. **Auto-fallback** (the Microsoft-devbox happy path): if no bin pin
+ *     and `copilot` is not on PATH but `agency` is, promote to
+ *     `agency copilot` automatically. Opt out with `MAESTRO_COPILOT_AGENCY=0`.
+ *  4. Otherwise: direct mode with `copilot` (which may still resolve fine,
+ *     or fall through to a spawn-time error if missing).
+ */
+function resolveCopilot(): CopilotResolution {
+  const requestedInfo = resolveBin(RAW_BIN_REQUESTED);
+  const requestedBase = path.basename(RAW_BIN_REQUESTED).toLowerCase();
+  const requestedIsAgency =
+    requestedBase === 'agency' || requestedBase.startsWith('agency.');
 
-if (COPILOT_LAUNCH_MODE === 'agency') {
-  // Sanity check: in agency mode, prefix args must include `copilot` (or the
-  // user is on a setup we don't recognise). Warn loudly so the misconfig is
-  // visible at startup rather than at spawn time.
+  // Case 1+2: user pinned bin OR explicit agency=1 — no auto-fallback.
+  if (USER_SET_BIN || AGENCY_EXPLICITLY_ENABLED) {
+    const mode: CopilotLaunchMode =
+      AGENCY_EXPLICITLY_ENABLED || requestedIsAgency ? 'agency' : 'direct';
+    return {
+      mode,
+      binInfo: requestedInfo,
+      prefixArgs: USER_PREFIX_ARGS,
+      displayBin: RAW_BIN_REQUESTED,
+      autoAgency: false,
+    };
+  }
+
+  // Case 3: auto-fallback. Only when copilot is not on PATH and user did
+  // not opt out via MAESTRO_COPILOT_AGENCY=0.
+  if (!requestedInfo.found && !AGENCY_EXPLICITLY_DISABLED) {
+    const agencyInfo = resolveBin('agency');
+    if (agencyInfo.found) {
+      const prefix = USER_PREFIX_ARGS.includes('copilot')
+        ? USER_PREFIX_ARGS
+        : ['copilot', ...USER_PREFIX_ARGS];
+      return {
+        mode: 'agency',
+        binInfo: agencyInfo,
+        prefixArgs: prefix,
+        displayBin: 'agency',
+        autoAgency: true,
+      };
+    }
+  }
+
+  // Case 4: direct, possibly unresolved.
+  return {
+    mode: 'direct',
+    binInfo: requestedInfo,
+    prefixArgs: USER_PREFIX_ARGS,
+    displayBin: RAW_BIN_REQUESTED,
+    autoAgency: false,
+  };
+}
+
+const COPILOT_RESOLUTION = resolveCopilot();
+const COPILOT_BIN_INFO = COPILOT_RESOLUTION.binInfo;
+const COPILOT_BIN = COPILOT_BIN_INFO.path;
+const COPILOT_BIN_RAW = COPILOT_RESOLUTION.displayBin;
+const COPILOT_PREFIX_ARGS = COPILOT_RESOLUTION.prefixArgs;
+export const COPILOT_LAUNCH_MODE: CopilotLaunchMode = COPILOT_RESOLUTION.mode;
+const COPILOT_AUTO_AGENCY = COPILOT_RESOLUTION.autoAgency;
+
+// ───── startup diagnostics ─────
+
+if (COPILOT_AUTO_AGENCY) {
+  console.log(
+    `[maestro] Copilot: auto-detected agency launch mode — \`copilot\` is not on PATH but \`agency\` is. ` +
+      `Spawning sessions via \`agency copilot ...\`. ` +
+      `Override with MAESTRO_COPILOT_BIN=<path>, or disable auto-detection with MAESTRO_COPILOT_AGENCY=0.`,
+  );
+} else if (COPILOT_LAUNCH_MODE === 'agency') {
+  // Explicit agency configuration. Sanity-check prefix args.
   if (!COPILOT_PREFIX_ARGS.includes('copilot')) {
     console.warn(
-      `[maestro] WARNING: Copilot launch mode = agency, but MAESTRO_COPILOT_PREFIX_ARGS does not include "copilot". ` +
+      `[maestro] WARNING: Copilot launch mode = agency (explicit), but MAESTRO_COPILOT_PREFIX_ARGS does not include "copilot". ` +
         `Expected env: MAESTRO_COPILOT_BIN=agency MAESTRO_COPILOT_PREFIX_ARGS=copilot. ` +
         `Current MAESTRO_COPILOT_PREFIX_ARGS="${(process.env.MAESTRO_COPILOT_PREFIX_ARGS ?? '').trim()}".`,
     );
   }
-  console.warn(`[maestro] Copilot launch mode: agency (binary="${COPILOT_BIN_RAW}")`);
+  console.log(`[maestro] Copilot launch mode: agency (binary="${COPILOT_BIN_RAW}")`);
+} else if (!COPILOT_BIN_INFO.found) {
+  // Direct mode, copilot binary missing. Auto-fallback already covered the
+  // common Microsoft-devbox case; this only fires when the user disabled
+  // auto-fallback or pinned a missing custom path.
+  console.warn(
+    `[maestro] WARNING: Copilot CLI binary "${COPILOT_BIN_RAW}" not found on PATH. ` +
+      `Copilot sessions will fail to spawn. ` +
+      `Install hint: \`npm install -g @github/copilot\` (then ensure the npm global bin dir is on PATH), ` +
+      `or on Windows install via WinGet (\`winget install GitHub.Copilot\`), ` +
+      `or set MAESTRO_COPILOT_BIN to an absolute path to the executable, then restart maestro.`,
+  );
 }
+
 
 // ───────── events.jsonl helpers ─────────
 
@@ -650,26 +711,21 @@ function buildSpawnError(err: unknown, args: readonly string[]): Error {
     `failed to spawn Copilot CLI: ${inner}`,
     `  attempted binary: ${COPILOT_BIN}`,
     `  argv:             ${args.join(' ')}`,
-    `  launch mode:      ${COPILOT_LAUNCH_MODE}`,
+    `  launch mode:      ${COPILOT_LAUNCH_MODE}${COPILOT_AUTO_AGENCY ? ' (auto-detected)' : ''}`,
   ];
   if (COPILOT_BIN_RAW !== COPILOT_BIN) {
     parts.push(`  configured name:  ${COPILOT_BIN_RAW}`);
   }
   if (!COPILOT_BIN_INFO.found) {
-    if (AGENCY_ON_PATH && COPILOT_BIN_RAW === 'copilot') {
+    parts.push(
+      `  resolution:       NOT FOUND on PATH at server startup`,
+      `  fix:              install Copilot CLI on this host (e.g. \`npm install -g @github/copilot\` or \`winget install GitHub.Copilot\`),`,
+      `                    or set MAESTRO_COPILOT_BIN to an absolute path to the executable, then restart maestro.`,
+    );
+    if (AGENCY_EXPLICITLY_DISABLED) {
       parts.push(
-        `  resolution:       NOT FOUND on PATH at server startup`,
-        `  detected:         "agency" IS on PATH — this looks like a Microsoft devbox.`,
-        `  fix:              restart maestro with agency launch mode enabled:`,
-        `                        MAESTRO_COPILOT_BIN=agency`,
-        `                        MAESTRO_COPILOT_PREFIX_ARGS=copilot`,
-        `                    (see CLAUDE.md → "Copilot launch modes")`,
-      );
-    } else {
-      parts.push(
-        `  resolution:       NOT FOUND on PATH at server startup`,
-        `  fix:              install Copilot CLI on this host (e.g. \`npm install -g @github/copilot\` or \`winget install GitHub.Copilot\`),`,
-        `                    or set MAESTRO_COPILOT_BIN to an absolute path to the executable, then restart maestro.`,
+        `  note:             MAESTRO_COPILOT_AGENCY=0 disabled auto-fallback to \`agency copilot\`.`,
+        `                    Unset it (or set to 1) to let maestro pick up \`agency\` automatically.`,
       );
     }
   } else {

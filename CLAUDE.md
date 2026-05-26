@@ -89,19 +89,24 @@ Strategies are registered as side-effects of importing `agents/all.ts`, which al
 | Var | Default | Whitespace-split? | Purpose |
 | --- | --- | --- | --- |
 | `MAESTRO_CLAUDE_BIN` | `claude` | no | Path to the Claude binary (supports spaces). |
-| `MAESTRO_COPILOT_BIN` | `copilot` | no | Path to the Copilot binary (supports spaces). On Microsoft devboxes, point this at `agency` and **also** set `MAESTRO_COPILOT_PREFIX_ARGS=copilot` to launch via `agency copilot` (see "Copilot launch modes" below). |
-| `MAESTRO_COPILOT_PREFIX_ARGS` | _(unset)_ | yes | Optional args inserted between the binary and the session flag. In direct mode, leave unset. In agency mode, set to `copilot` (the subcommand `agency` dispatches to). |
-| `MAESTRO_COPILOT_AGENCY` | _(unset)_ | no | Set to `1` to force agency launch mode regardless of `MAESTRO_COPILOT_BIN` basename. Useful when `MAESTRO_COPILOT_BIN` is an absolute path or wrapper whose basename isn't `agency`. |
+| `MAESTRO_COPILOT_BIN` | `copilot` | no | Path to the Copilot binary (supports spaces). Leave unset on Microsoft devboxes — maestro auto-detects `agency` (see "Copilot launch modes" below). |
+| `MAESTRO_COPILOT_PREFIX_ARGS` | _(unset)_ | yes | Optional args inserted between the binary and the session flag. Leave unset in direct mode; leave unset in auto-detected agency mode (maestro prepends `copilot` automatically); set to `copilot` if you pin `MAESTRO_COPILOT_BIN=agency` explicitly. |
+| `MAESTRO_COPILOT_AGENCY` | _(unset)_ | no | `1` forces agency mode regardless of binary; `0` disables auto-fallback (use this if you have an unrelated tool named `agency` on PATH that maestro keeps picking up). Unset = auto-detect. |
 | `MAESTRO_STORE_DIR` | `~/.claude-maestro` | no | Override the registry directory. |
 
 **Copilot launch modes:**
 
-The Copilot strategy supports two launch modes, detected at maestro startup:
+The Copilot strategy supports two launch modes, decided at maestro startup:
 
-- **`direct`** (default) — maestro owns the session uuid and passes it as `--session-id=<uuid>` for new sessions, `--resume=<uuid>` for resume. Used when `MAESTRO_COPILOT_BIN` points directly at `copilot` (or `copilot.exe`, `copilot.cmd`, …).
+- **`direct`** (default when `copilot` is on PATH) — maestro owns the session uuid and passes it as `--session-id=<uuid>` for new sessions, `--resume=<uuid>` for resume.
 - **`agency`** — for Microsoft devboxes where Copilot must be launched through the `agency` wrapper (auth, env, sandbox). Agency injects its own `--session-id` for new sessions, so maestro must NOT pass one. Maestro discovers the agency-issued uuid post-spawn by snapshotting `~/.copilot/session-state/` before the spawn and watching for the newly created dir (10 s timeout, 200 ms poll, birthtime/ctime-filtered, fails closed on zero/multiple matches). The discovered uuid is persisted as `copilotSessionId`. For resume, maestro issues `agency copilot --resume=<copilotSessionId>` — verified to forward through `agency` to `copilot`.
 
-Mode detection priority: `MAESTRO_COPILOT_AGENCY=1` (explicit override) > `path.basename(MAESTRO_COPILOT_BIN).toLowerCase()` is `agency` or starts with `agency.` (catches `agency.exe`, `agency.cmd`) > `direct`.
+**Mode resolution priority (at maestro startup):**
+
+1. User pinned `MAESTRO_COPILOT_BIN` → honor it. Launch mode comes from `MAESTRO_COPILOT_AGENCY` if explicit, else from the bin's basename (`agency`, `agency.exe`, `agency.cmd` → agency; otherwise direct).
+2. `MAESTRO_COPILOT_AGENCY=1` → force agency with whatever bin/prefix args the user set.
+3. **Auto-fallback** (the Microsoft-devbox happy path): no bin pin AND `copilot` is not on PATH AND `agency` is on PATH → promote silently to `agency copilot`. Opt out with `MAESTRO_COPILOT_AGENCY=0`.
+4. Otherwise → direct mode with `copilot` (may fail at spawn time if missing).
 
 Each Copilot session records its launch mode at create time (`copilotLaunchMode` in `sessions.json`). If maestro restarts in a different mode, spawn fails closed with a clear error rather than silently starting a fresh session and losing conversation history. To switch modes for an existing session, restart maestro with the original env vars, or delete the session and create a new one.
 
