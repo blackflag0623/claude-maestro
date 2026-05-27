@@ -2,7 +2,6 @@ import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
-import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -12,23 +11,21 @@ import { debug } from './debug.js';
 import type {
   AgentType,
   ChatMessage,
-  ChatMode,
   ClientMessage,
   ServerMessage,
   SessionInfo,
   SessionActivity,
   CreateSessionBody,
-  ToolCallStatus,
 } from '../shared/protocol.js';
-import { AGENT_TYPES, ASK_UQ_ANSWER_PREFIX } from '../shared/protocol.js';
+import { AGENT_TYPES } from '../shared/protocol.js';
 import { getStrategy, type AgentReader, type SpawnTarget } from './agents/index.js';
 import { initAgentEnvironments } from './agents/all.js';
-import {
-  requestVerdict,
-  resolveVerdict,
-  clearVerdictsForSession,
-  type ToolVerdict,
-} from './hook-pending.js';
+import { resolveVerdict, clearVerdictsForSession } from './hook-pending.js';
+import { ScrollbackStore } from './scrollback-store.js';
+import { BubbleStore } from './bubble-store.js';
+import { ChatGating } from './chat-gating.js';
+import { mountFsRoutes, expandHome } from './fs-routes.js';
+import { mountSecurityMiddleware } from './http-security.js';
 
 function isAgentType(x: unknown): x is AgentType {
   return typeof x === 'string' && (AGENT_TYPES as readonly string[]).includes(x);
@@ -105,38 +102,16 @@ interface Session extends PersistedSession {
 
 const sessions = new Map<string, Session>();
 
-// ───────── chat mode (per-WS-subscriber) ─────────
-//
-// Each chat WS subscriber carries a mode controlling whether PreToolUse hooks
-// broadcast a pending bubble and await a phone verdict, or just auto-allow.
-// Stored as a WeakMap so closing the socket auto-cleans the entry. With
-// chat-attach exclusivity, only one subscriber's mode is ever in effect.
-const chatModes = new WeakMap<WebSocket, ChatMode>();
-
-function getChatMode(ws: WebSocket): ChatMode {
-  return chatModes.get(ws) ?? 'auto';
-}
-function setChatMode(ws: WebSocket, m: ChatMode) {
-  chatModes.set(ws, m);
-}
-function effectiveSessionMode(s: Session): ChatMode {
-  let best: ChatMode = 'auto';
-  for (const ws of s.chatSubscribers) {
-    const m = getChatMode(ws);
-    if (m === 'always-pause') return 'always-pause';
-    if (m === 'pause-next') best = 'pause-next';
-  }
-  return best;
-}
-function consumePauseNext(s: Session) {
-  for (const ws of s.chatSubscribers) {
-    if (getChatMode(ws) === 'pause-next') {
-      setChatMode(ws, 'auto');
-      const echo: ServerMessage = { type: 'chatMode', mode: 'auto' };
-      try { ws.send(JSON.stringify(echo)); } catch {}
-    }
-  }
-}
+const scrollbackStore = new ScrollbackStore({
+  dir: SCROLLBACK_DIR,
+  debounceMs: SCROLLBACK_FLUSH_DEBOUNCE_MS,
+  enabled: SCROLLBACK_PERSIST_ENABLED,
+});
+const bubbleStore = new BubbleStore(BUBBLES_DIR);
+const chatGating = new ChatGating({
+  bubbleStore,
+  broadcastChat: (s, msg) => broadcastChat(s as Session, msg),
+});
 
 // ───────── persistence ─────────
 
@@ -205,7 +180,7 @@ function loadPersisted() {
       continue;
     }
     const scrollback = new ScrollbackBuffer(SCROLLBACK_BYTES);
-    loadScrollback(p.id, scrollback);
+    scrollbackStore.hydrate(p.id, scrollback);
     sessions.set(p.id, {
       id: p.id,
       title: p.title ?? `node-${p.id.slice(0, 4)}`,
@@ -223,7 +198,7 @@ function loadPersisted() {
       subscribers: new Set(),
       chatSubscribers: new Set(),
       reader: null,
-      syntheticBubbles: loadBubbles(p.id),
+      syntheticBubbles: bubbleStore.load(p.id),
       activity: 'unknown',
     });
   }
@@ -235,81 +210,16 @@ function loadPersisted() {
 // PTY bytes mirrored to ~/.claude-maestro/scrollback/<id>.bin so the visual
 // buffer survives maestro restart. Writes debounce ~2s and use rename-over-
 // temp. Disable via MAESTRO_DISABLE_SCROLLBACK_PERSIST=1 (see KNOWN_ISSUES.md).
-
-const pendingScrollbackFlush = new Map<string, NodeJS.Timeout>();
-
-function scrollbackPathFor(id: string): string {
-  return path.join(SCROLLBACK_DIR, `${id}.bin`);
-}
-
-function loadScrollback(id: string, buf: ScrollbackBuffer) {
-  if (!SCROLLBACK_PERSIST_ENABLED) return;
-  const p = scrollbackPathFor(id);
-  try {
-    if (!fs.existsSync(p)) return;
-    const data = fs.readFileSync(p, 'utf8');
-    buf.hydrate(data);
-  } catch (err) {
-    // Corrupt / unreadable file shouldn't block boot — just log and move on.
-    console.warn(`[maestro] failed to read scrollback for ${id}:`, (err as Error).message);
-  }
-}
-
-function flushScrollback(s: Session) {
-  if (!SCROLLBACK_PERSIST_ENABLED) return;
-  const dst = scrollbackPathFor(s.id);
-  const tmp = `${dst}.tmp`;
-  try {
-    fs.mkdirSync(SCROLLBACK_DIR, { recursive: true });
-    fs.writeFileSync(tmp, s.scrollback.read(), 'utf8');
-    fs.renameSync(tmp, dst);
-  } catch (err) {
-    console.warn(`[maestro] failed to flush scrollback for ${s.id}:`, (err as Error).message);
-    try {
-      fs.unlinkSync(tmp);
-    } catch {}
-  }
-}
-
-function scheduleScrollbackFlush(s: Session) {
-  if (!SCROLLBACK_PERSIST_ENABLED) return;
-  const existing = pendingScrollbackFlush.get(s.id);
-  if (existing) clearTimeout(existing);
-  const t = setTimeout(() => {
-    pendingScrollbackFlush.delete(s.id);
-    flushScrollback(s);
-  }, SCROLLBACK_FLUSH_DEBOUNCE_MS);
-  // Don't keep the Node process alive just because a debounce window is
-  // open — the SIGINT/SIGTERM handlers will flush synchronously on exit.
-  t.unref();
-  pendingScrollbackFlush.set(s.id, t);
-}
-
-function deleteScrollback(id: string) {
-  const pending = pendingScrollbackFlush.get(id);
-  if (pending) {
-    clearTimeout(pending);
-    pendingScrollbackFlush.delete(id);
-  }
-  if (!SCROLLBACK_PERSIST_ENABLED) return;
-  try {
-    fs.unlinkSync(scrollbackPathFor(id));
-  } catch {
-    // File may not exist (session created and killed before any flush).
-  }
-}
+// Implementation lives in `scrollback-store.ts`; this section is just the
+// glue that pairs sessions with the store.
 
 /** Synchronously flush every pending scrollback file. Called from the
  *  SIGINT / SIGTERM / beforeExit handlers — must not be async because Node
  *  won't await a signal handler before exiting. */
 function flushAllScrollbackSync() {
-  if (!SCROLLBACK_PERSIST_ENABLED) return;
-  for (const [id, timer] of pendingScrollbackFlush) {
-    clearTimeout(timer);
-    const s = sessions.get(id);
-    if (s) flushScrollback(s);
-  }
-  pendingScrollbackFlush.clear();
+  const reads = new Map<string, () => string>();
+  for (const [id, s] of sessions) reads.set(id, () => s.scrollback.read());
+  scrollbackStore.flushAll(reads);
 }
 
 // ───────── helpers ─────────
@@ -331,7 +241,7 @@ function toInfo(s: Session): SessionInfo {
 
 function appendScrollback(s: Session, data: string) {
   s.scrollback.append(data);
-  scheduleScrollbackFlush(s);
+  scrollbackStore.schedule(s.id, () => s.scrollback.read());
 }
 
 function broadcast(s: Session, msg: ServerMessage) {
@@ -355,66 +265,6 @@ function broadcastChat(s: Session, msg: ServerMessage) {
   for (const ws of s.chatSubscribers) {
     if (ws.readyState === ws.OPEN) ws.send(payload);
   }
-}
-
-// ───────── synthetic tool_call bubbles ─────────
-//
-// PreToolUse-derived bubbles aren't in the JSONL transcript, so we persist
-// them per-session as append-only JSONL under STORE_DIR/bubbles/<id>.jsonl.
-// Load collapses by toolCallId (latest write wins) so pending → answered
-// status flips just append another line.
-
-function bubblesPath(sessionId: string): string {
-  return path.join(BUBBLES_DIR, `${sessionId}.jsonl`);
-}
-function appendBubble(sessionId: string, m: ChatMessage) {
-  try {
-    fs.mkdirSync(BUBBLES_DIR, { recursive: true });
-    fs.appendFileSync(bubblesPath(sessionId), JSON.stringify(m) + '\n');
-  } catch (err) {
-    console.error('[maestro] bubble persist failed:', (err as Error).message);
-  }
-}
-function loadBubbles(sessionId: string): Map<string, ChatMessage> {
-  const out = new Map<string, ChatMessage>();
-  const p = bubblesPath(sessionId);
-  if (!fs.existsSync(p)) return out;
-  let raw: string;
-  try {
-    raw = fs.readFileSync(p, 'utf8');
-  } catch {
-    return out;
-  }
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let parsed: ChatMessage;
-    try {
-      parsed = JSON.parse(trimmed) as ChatMessage;
-    } catch {
-      continue;
-    }
-    if (parsed && parsed.type === 'tool_call') {
-      out.set(parsed.toolCallId, parsed);
-    }
-  }
-  return out;
-}
-function deleteBubbleFile(sessionId: string) {
-  try { fs.rmSync(bubblesPath(sessionId), { force: true }); } catch {}
-}
-
-/** Broadcast a tool_call bubble AND remember it on the session so a
- *  reconnecting chat client can replay it. Status updates replace prior
- *  entries with the same toolCallId. */
-function broadcastToolCall(s: Session, m: Extract<ChatMessage, { type: 'tool_call' }>) {
-  s.syntheticBubbles.set(m.toolCallId, m);
-  if (s.syntheticBubbles.size > 500) {
-    const firstKey = s.syntheticBubbles.keys().next().value as string | undefined;
-    if (firstKey !== undefined) s.syntheticBubbles.delete(firstKey);
-  }
-  appendBubble(s.id, m);
-  broadcastChat(s, { type: 'chatMessage', message: m });
 }
 
 function resizeSession(s: Session, cols: number, rows: number) {
@@ -482,11 +332,7 @@ function writeToPty(s: Session, data: string) {
   pump();
 }
 
-function expandHome(p: string): string {
-  if (p === '~') return os.homedir();
-  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
-  return p;
-}
+// expandHome is imported from fs-routes (single definition).
 
 function setActivity(s: Session, a: SessionActivity) {
   if (s.activity === a) return;
@@ -642,8 +488,8 @@ function killSession(id: string): boolean {
   }
   sessions.delete(id);
   persist();
-  deleteScrollback(id);
-  deleteBubbleFile(id);
+  scrollbackStore.remove(id);
+  bubbleStore.remove(id);
   // Note: leaves the agent's on-disk transcript intact (Claude's
   // ~/.claude/projects/<slug>/<uuid>.jsonl or Copilot's
   // ~/.copilot/session-state/<uuid>/events.jsonl) so the user can still
@@ -655,55 +501,7 @@ function killSession(id: string): boolean {
 
 const app = express();
 app.use(express.json());
-
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', req.headers.origin ?? '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Vary', 'Origin');
-  if (req.method === 'OPTIONS') {
-    res.status(204).end();
-    return;
-  }
-  next();
-});
-
-// Security headers for the static client pages. We can't lock `connect-src`
-// down because the desktop client connects to user-configured remote maestro
-// servers over HTTP(S)/WS(S); the rest of the policy still reduces blast
-// radius (no inline <script>, no framing, only known CDNs).
-//
-// `style-src 'unsafe-inline'` is required: both clients use inline
-// `style="--var:…"` attributes for dynamic CSS variables. The DOMPurify-
-// sanitized chat markdown also relies on `'unsafe-inline'` to render the
-// few inline styles marked allows by default. Tightening this would mean
-// either nonces (server-rendered, can't statically serve) or hashes for
-// every inline style — neither is worth the churn for this app's threat model.
-const CSP = [
-  "default-src 'self'",
-  "script-src 'self' https://cdn.jsdelivr.net",
-  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-  "font-src 'self' https://fonts.gstatic.com",
-  // `blob:` is required for `@xterm/addon-image` — the renderer creates
-  // ObjectURLs for decoded sixel / iTerm IIP frames before painting them
-  // onto the overlay canvas. Without `blob:` here the addon silently fails
-  // in production builds (Vite dev is more permissive about CSP).
-  "img-src 'self' data: blob:",
-  "connect-src 'self' ws: wss: http: https:",
-  "frame-ancestors 'none'",
-  "base-uri 'self'",
-  "form-action 'self'",
-].join('; ');
-
-app.use((req, res, next) => {
-  if (!req.path.startsWith('/api/')) {
-    res.setHeader('Content-Security-Policy', CSP);
-    res.setHeader('X-Frame-Options', 'DENY');
-  }
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  next();
-});
+mountSecurityMiddleware(app);
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, name: 'claude-maestro', version: PKG_VERSION, sessions: sessions.size });
@@ -756,271 +554,14 @@ app.post('/api/hook', async (req, res) => {
   // in the chat-bridged Allow/Deny flow. Others' PreToolUse (if they have one
   // at all) just gets a 204 like any other event.
   if (s && getStrategy(s.agentType).supportsPermissionGating && event === 'PreToolUse') {
-    const verdict = await handlePreToolUse(s, req.body ?? {});
+    const verdict = await chatGating.handlePreToolUse(s, req.body ?? {});
     res.json(verdict);
     return;
   }
   res.status(204).end();
 });
 
-/** Bridge a PreToolUse hook through the mobile chat (if any). Always
- *  resolves with a verdict the hook script can serialize as
- *  `permissionDecision: 'allow' | 'deny'`. */
-async function handlePreToolUse(
-  s: Session,
-  body: Record<string, unknown>,
-): Promise<ToolVerdict> {
-  const toolName = String(body.tool_name ?? 'unknown');
-  const toolInput = body.tool_input ?? {};
-  const toolCallId =
-    (body.tool_use_id as string | undefined) ?? crypto.randomUUID();
-  const ts = Date.now();
-
-  const mode = effectiveSessionMode(s);
-
-  // AskUserQuestion: always intercept when a chat client is attached, even in
-  // auto mode — otherwise the desktop TUI menu grabs the answer and the phone
-  // sees a spurious result. Translates chosen option to deny+reason so Claude
-  // reads it as user feedback. If no chat subscriber is present, fall through
-  // to allow so desktop TUI handles it normally.
-  const isAskUQ = toolName === 'AskUserQuestion';
-  const forcePause = isAskUQ && s.chatSubscribers.size > 0;
-
-  if (mode === 'auto' && !forcePause) {
-    broadcastToolCall(s, {
-      type: 'tool_call',
-      toolCallId,
-      toolName,
-      toolInput,
-      status: 'allowed',
-      ts,
-    });
-    return { decision: 'allow' };
-  }
-
-  broadcastToolCall(s, {
-    type: 'tool_call',
-    toolCallId,
-    toolName,
-    toolInput,
-    status: 'pending',
-    ts,
-  });
-  debug(`[hook] PreToolUse ${s.id.slice(0, 8)} ${toolName} — awaiting verdict (mode=${mode}${forcePause ? ', force-pause' : ''})`);
-  const verdict = await requestVerdict(s.id, toolCallId, 55_000);
-  debug(`[hook] PreToolUse ${s.id.slice(0, 8)} ${toolName} → ${verdict.decision}${verdict.timedOut ? ' (timeout)' : ''}`);
-
-  // AskUserQuestion bridge: convert verdict to deny+reason so Claude reads
-  // it as user feedback. On timeout, deny with a "no answer" reason so Claude
-  // moves on rather than auto-allowing into a broken TUI flow.
-  let effectiveVerdict: ToolVerdict = verdict;
-  if (isAskUQ) {
-    effectiveVerdict = {
-      decision: 'deny',
-      reason: verdict.reason ?? (verdict.timedOut ? 'no answer from mobile user' : 'no selection'),
-      timedOut: verdict.timedOut,
-    };
-  }
-
-  let status: ToolCallStatus;
-  let displayReason = effectiveVerdict.reason;
-  if (isAskUQ) {
-    if (effectiveVerdict.timedOut) {
-      status = 'timedout';
-    } else {
-      status = 'answered';
-      if (displayReason && displayReason.startsWith(ASK_UQ_ANSWER_PREFIX)) {
-        displayReason = displayReason.slice(ASK_UQ_ANSWER_PREFIX.length);
-      }
-    }
-  } else {
-    status = effectiveVerdict.timedOut
-      ? 'timedout'
-      : effectiveVerdict.decision === 'deny'
-        ? 'denied'
-        : 'allowed';
-  }
-  broadcastToolCall(s, {
-    type: 'tool_call',
-    toolCallId,
-    toolName,
-    toolInput,
-    status,
-    denyReason: displayReason,
-    ts: Date.now(),
-  });
-
-  // pause-next is one-shot. AskUQ bridging doesn't consume it (the pause was
-  // forced for this tool regardless of mode).
-  if (!isAskUQ) consumePauseNext(s);
-
-  return effectiveVerdict;
-}
-
-// ───────── filesystem completion ─────────
-
-const FS_LIMIT = 50;
-const FS_EXCLUDE = new Set(['node_modules']);
-
-app.get('/api/fs/complete', (req, res) => {
-  const raw = String(req.query.prefix ?? '').trim();
-  const showHidden = raw.includes('/.') || raw.includes('\\.') || /(?:^|[\\/])\.[^\\/]*$/.test(raw);
-
-  const expanded = expandHome(raw || '~');
-  const sep = expanded.includes('\\') ? '\\' : '/';
-  const endsWithSep = /[\\/]$/.test(expanded);
-
-  let dir: string;
-  let needle: string;
-  if (!raw) {
-    dir = os.homedir();
-    needle = '';
-  } else if (endsWithSep) {
-    dir = expanded;
-    needle = '';
-  } else {
-    dir = path.dirname(expanded);
-    needle = path.basename(expanded);
-  }
-
-  let dirents: fs.Dirent[];
-  try {
-    dirents = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    res.json({ base: dir, entries: [] });
-    return;
-  }
-
-  const needleLower = needle.toLowerCase();
-  const out: string[] = [];
-  for (const d of dirents) {
-    if (!d.isDirectory()) continue;
-    if (FS_EXCLUDE.has(d.name)) continue;
-    if (!showHidden && d.name.startsWith('.')) continue;
-    if (needleLower && !d.name.toLowerCase().startsWith(needleLower)) continue;
-    out.push(path.join(dir, d.name) + sep);
-    if (out.length >= FS_LIMIT) break;
-  }
-  out.sort((a, b) => a.localeCompare(b));
-  res.json({ base: dir, entries: out });
-});
-
-// ───────── filesystem browse + read (per-session, clamped to cwd) ─────────
-
-const FS_READ_MAX_BYTES = 2 * 1024 * 1024;
-
-function resolveInsideCwd(cwd: string, rel: string): { abs: string; rel: string } {
-  const abs = path.resolve(cwd, rel || '.');
-  const r = path.relative(cwd, abs);
-  const outside = r.startsWith('..') || path.isAbsolute(r);
-  if (outside) {
-    const e = new Error('path is outside session cwd') as Error & { code?: string };
-    e.code = 'OUTSIDE_CWD';
-    throw e;
-  }
-  return { abs, rel: r };
-}
-
-app.get('/api/fs/list', (req, res) => {
-  const sid = String(req.query.sessionId ?? '');
-  const s = sessions.get(sid);
-  if (!s) {
-    res.status(404).json({ error: 'session not found' });
-    return;
-  }
-  const rel = String(req.query.path ?? '');
-  let resolved;
-  try {
-    resolved = resolveInsideCwd(s.cwd, rel);
-  } catch (err) {
-    const e = err as Error & { code?: string };
-    res.status(e.code === 'OUTSIDE_CWD' ? 403 : 400).json({ error: e.message });
-    return;
-  }
-  let dirents: fs.Dirent[];
-  try {
-    dirents = fs.readdirSync(resolved.abs, { withFileTypes: true });
-  } catch (err) {
-    res.status(400).json({ error: (err as Error).message });
-    return;
-  }
-  const entries = dirents.map((d) => {
-    const kind: 'dir' | 'file' | 'other' = d.isDirectory() ? 'dir' : d.isFile() ? 'file' : 'other';
-    const entry: { name: string; kind: typeof kind; size?: number; mtime?: number } = {
-      name: d.name,
-      kind,
-    };
-    if (kind === 'file') {
-      try {
-        const st = fs.statSync(path.join(resolved.abs, d.name));
-        entry.size = st.size;
-        entry.mtime = st.mtimeMs;
-      } catch {}
-    }
-    return entry;
-  });
-  entries.sort((a, b) => {
-    if (a.kind !== b.kind) {
-      if (a.kind === 'dir') return -1;
-      if (b.kind === 'dir') return 1;
-    }
-    return a.name.localeCompare(b.name);
-  });
-  res.json({ cwd: s.cwd, path: resolved.rel, abs: resolved.abs, entries });
-});
-
-app.get('/api/fs/read', (req, res) => {
-  const sid = String(req.query.sessionId ?? '');
-  const s = sessions.get(sid);
-  if (!s) {
-    res.status(404).json({ error: 'session not found' });
-    return;
-  }
-  const rel = String(req.query.path ?? '');
-  let resolved;
-  try {
-    resolved = resolveInsideCwd(s.cwd, rel);
-  } catch (err) {
-    const e = err as Error & { code?: string };
-    res.status(e.code === 'OUTSIDE_CWD' ? 403 : 400).json({ error: e.message });
-    return;
-  }
-  let st: fs.Stats;
-  try {
-    st = fs.statSync(resolved.abs);
-  } catch (err) {
-    res.status(404).json({ error: (err as Error).message });
-    return;
-  }
-  if (st.isDirectory()) {
-    res.status(400).json({ error: 'path is a directory' });
-    return;
-  }
-  if (st.size > FS_READ_MAX_BYTES) {
-    res.status(413).json({ error: `file too large (${st.size} bytes, max ${FS_READ_MAX_BYTES})` });
-    return;
-  }
-  let buf: Buffer;
-  try {
-    buf = fs.readFileSync(resolved.abs);
-  } catch (err) {
-    res.status(400).json({ error: (err as Error).message });
-    return;
-  }
-  const sniff = buf.subarray(0, Math.min(buf.length, 8192));
-  const binary = sniff.includes(0);
-  if (binary) {
-    res.json({ binary: true, size: st.size, abs: resolved.abs });
-    return;
-  }
-  res.json({
-    binary: false,
-    size: st.size,
-    mtime: st.mtimeMs,
-    content: buf.toString('utf8'),
-    abs: resolved.abs,
-  });
-});
+mountFsRoutes(app, (sid) => sessions.get(sid)?.cwd ?? null);
 
 const clientDist = path.resolve(__dirname, '../client');
 const mobileDist = path.resolve(__dirname, '../client-mobile');
@@ -1200,7 +741,7 @@ function attach(ws: WebSocket, sessionId: string) {
         return;
       }
       attached = true;
-      setChatMode(ws, 'auto');
+      chatGating.setMode(ws, 'auto');
       // Merge JSONL transcript entries with in-memory synthetic tool_call
       // bubbles, sorted by ts so the conversation reads chronologically.
       const transcript = s.reader.readAll();
@@ -1234,7 +775,7 @@ function attach(ws: WebSocket, sessionId: string) {
       resizeSession(s, msg.cols, msg.rows);
     } else if (msg.type === 'setChatMode') {
       if (mode !== 'chat') return;
-      setChatMode(ws, msg.mode);
+      chatGating.setMode(ws, msg.mode);
       ws.send(JSON.stringify({ type: 'chatMode', mode: msg.mode } satisfies ServerMessage));
       debug(`[chat] ${s.id.slice(0, 8)} mode → ${msg.mode}`);
     } else if (msg.type === 'toolDecision') {
