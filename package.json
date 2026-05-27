@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "concurrently -k -n server,client,mobile -c blue,magenta,green \"npm:dev:server\" \"npm:dev:client\" \"npm:dev:client:mobile\"",
     "dev:server": "tsx watch src/server/index.ts",
-    "dev:client": "vite",
-    "dev:client:mobile": "vite --config vite.mobile.config.ts",
+    "dev:client": "vite --force",
+    "dev:client:mobile": "vite --force --config vite.mobile.config.ts",
     "build": "vite build && vite build --config vite.mobile.config.ts && tsc -p tsconfig.server.json",
     "start": "node dist/server/index.js"
   },
