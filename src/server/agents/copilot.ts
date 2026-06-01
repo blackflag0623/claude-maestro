@@ -8,11 +8,17 @@
 //
 // Two launch modes are supported:
 //
-//   1. DIRECT (default) — maestro owns the session uuid. Spawn invocation:
-//        new:    `copilot --session-id=<uuid>`
-//        resume: `copilot --resume=<uuid>`
-//      The `=` form is REQUIRED — copilot's parser treats `--session-id <uuid>`
-//      (space-separated) as a boolean flag plus a positional resume name.
+//   1. DIRECT (default) — maestro owns the session uuid. Spawn invocation
+//      is always `copilot --session-id=<uuid>` regardless of new/resume
+//      intent: per `copilot --help`, --session-id is symmetric — it sets the
+//      uuid for a new session if none exists, or resumes the existing one.
+//      This makes maestro robust against Copilot or the user cleaning up
+//      `~/.copilot/session-state/<uuid>/` between restarts: rather than
+//      hard-failing with `No session matched <uuid>` (what `--resume=<uuid>`
+//      would do), Copilot just creates a fresh session under the same uuid
+//      and the node stays usable. The `=` form is REQUIRED — copilot's
+//      parser treats `--session-id <uuid>` (space-separated) as a boolean
+//      flag plus a positional resume name.
 //
 //   2. AGENCY — `agency` wraps copilot (e.g. Microsoft devboxes). The wrapper
 //      injects its own session flags into the forwarded argv, so maestro
@@ -24,7 +30,11 @@
 //      watching `~/.copilot/session-state/` for a newly-created directory
 //      (see `discoverAgencyUuid` below), then records it on the session via
 //      `target.onCopilotSessionId(...)` so it's persisted for cross-restart
-//      resume.
+//      resume. Resume pre-flight: if the events.jsonl for the recorded
+//      copilotSessionId is gone, clear the recorded id and downgrade to a
+//      fresh agency session (agency picks a new uuid). The server surfaces a
+//      banner via `target.onResumeUnavailable` so the user understands why
+//      the conversation was reset.
 //
 // Mode detection (precedence):
 //   1. `MAESTRO_COPILOT_AGENCY=1` → agency mode (explicit opt-in).
@@ -586,7 +596,35 @@ export const copilotStrategy: AgentStrategy = {
   },
 
   spawn(target: SpawnTarget, mode: SpawnMode): pty.IPty {
-    const args = buildSpawnArgs(target, mode);
+    // Pre-flight (agency mode only): if a resume was requested but the
+    // agency-issued session-state dir is gone (cleaned up by the user, by
+    // Copilot, or by agency itself between maestro restarts), the
+    // `--resume=<uuid>` call would hard-fail with
+    //   "Error: No session, task, or name matched '<uuid>'."
+    // Detect ahead of time, clear the stale copilotSessionId, and downgrade
+    // to a fresh agency session. The server-side `onResumeUnavailable`
+    // callback shows a banner so the user knows the conversation was reset.
+    //
+    // Direct mode doesn't need this: --session-id is symmetric (creates if
+    // missing, resumes if present), so Copilot recovers transparently.
+    let effectiveMode = mode;
+    const state = getCopilotState(target);
+    if (
+      mode === 'resume' &&
+      COPILOT_LAUNCH_MODE === 'agency' &&
+      state.copilotSessionId &&
+      !fs.existsSync(eventsPathFor(state.copilotSessionId))
+    ) {
+      const oldId = state.copilotSessionId;
+      state.copilotSessionId = undefined;
+      target.onAgentStateChange?.({ ...state });
+      target.onResumeUnavailable?.(
+        `agency-issued Copilot session ~/.copilot/session-state/${oldId}/ is gone`,
+      );
+      effectiveMode = 'new';
+    }
+
+    const args = buildSpawnArgs(target, effectiveMode);
     let term: pty.IPty;
     try {
       term = pty.spawn(COPILOT_BIN, args, {
@@ -633,17 +671,23 @@ function buildSpawnArgs(target: SpawnTarget, mode: SpawnMode): string[] {
     return [...COPILOT_PREFIX_ARGS];
   }
 
-  // Direct mode. Defensive: if events.jsonl already exists for this session
-  // ID, force --resume even if hasResumeData was false. Catches the edge
-  // case where Maestro crashed between events.jsonl creation and the first
-  // PTY output that would normally have flipped hasResumeData.
-  const effectiveMode: SpawnMode =
-    mode === 'new' && fs.existsSync(eventsPathFor(target.id)) ? 'resume' : mode;
-  const sessionFlag = effectiveMode === 'new' ? '--session-id' : '--resume';
-  // Copilot's CLI parser requires `--flag=value`, not `--flag value`. Passing
-  // them as two tokens makes copilot treat the uuid as a positional resume
-  // name, which fails with "No session, task, or name matched '<uuid>'".
-  return [...COPILOT_PREFIX_ARGS, `${sessionFlag}=${target.id}`];
+  // Direct mode: `--session-id=<uuid>` is symmetric per `copilot --help`:
+  //   "Resume an existing session or task by ID, or set the UUID for a new
+  //    session."
+  // So we always pass the maestro session id with this flag regardless of
+  // new/resume intent. Concrete advantages:
+  //   - First spawn ever:  Copilot creates ~/.copilot/session-state/<uuid>/
+  //     and uses that uuid going forward. (Same as before.)
+  //   - Subsequent attach: if the dir still exists Copilot resumes; if it's
+  //     gone (manual cleanup, Copilot's own GC, OS reinstall), Copilot starts
+  //     a fresh session under the same uuid instead of hard-failing with
+  //     "No session, task, or name matched '<uuid>'" — which is what
+  //     `--resume=<uuid>` would do. Maestro never has to second-guess the
+  //     on-disk state.
+  // The `=` form is REQUIRED — copilot's parser treats `--session-id <uuid>`
+  // (space-separated) as a boolean flag plus a positional resume name.
+  void mode; // intentional: --session-id handles both branches.
+  return [...COPILOT_PREFIX_ARGS, `--session-id=${target.id}`];
 }
 
 function buildSpawnError(err: unknown, args: readonly string[]): Error {

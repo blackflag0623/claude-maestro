@@ -367,6 +367,21 @@ function spawnAgent(s: Session, mode: 'new' | 'resume') {
       s.agentState = next;
       persist();
     },
+    onResumeUnavailable: (reason: string) => {
+      // The strategy detected that a resume can't proceed (transcript / session
+      // record gone) and is downgrading to a fresh session. Reset the resume
+      // bookkeeping and surface a banner so the user knows the conversation
+      // was reset rather than silently lost.
+      if (s.hasResumeData) {
+        s.hasResumeData = false;
+        persist();
+      }
+      const banner =
+        `\r\n\x1b[33m[maestro] Cannot resume previous conversation: ${reason}.\r\n` +
+        `          Starting a fresh session in this node.\x1b[0m\r\n\r\n`;
+      appendScrollback(s, banner);
+      broadcastTerminal(s, { type: 'output', data: banner });
+    },
   };
 
   const term = strategy.spawn(target, mode);

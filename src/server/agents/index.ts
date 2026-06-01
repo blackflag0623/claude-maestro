@@ -43,6 +43,15 @@ export interface SpawnTarget {
    *  delta over its in-memory copy too, so callers can read back from
    *  `target.agentState` immediately. */
   onAgentStateChange?: (state: Record<string, unknown>) => void;
+  /** Strategy signals: "this spawn was requested as 'resume' but the
+   *  underlying agent transcript / session record is gone, so I am
+   *  downgrading to a fresh session." The server uses this to:
+   *    - reset `hasResumeData` (so subsequent restarts don't retry resume),
+   *    - emit a visible banner in the terminal so the user understands why
+   *      the conversation appears empty.
+   *  Strategies should call this BEFORE spawning the PTY. `reason` is a
+   *  short human-readable explanation included in the banner. */
+   onResumeUnavailable?: (reason: string) => void;
 }
 
 /** Callbacks an `AgentReader` invokes when it observes new events. The server
