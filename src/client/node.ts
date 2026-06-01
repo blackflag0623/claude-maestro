@@ -52,6 +52,12 @@ export class TerminalNode {
   private replayingScrollback = false;
   private newLinesWhileAway = 0;
   private prevBaseY = 0;
+  // Alt-buffer wheel-translation state (see attachCustomWheelEventHandler):
+  // accumulator + rate gate + idle reset together fix the "one wheel notch
+  // jumps N pages" problem for Copilot CLI and other paginated TUIs.
+  private wheelAccum = 0;
+  private wheelLastEmit = 0;
+  private wheelLastSeen = 0;
   session: SessionInfo | null = null;
 
   constructor(
@@ -245,21 +251,31 @@ export class TerminalNode {
     // viewport buffer has no history to scroll. Without translation, the
     // mouse wheel is a complete no-op in these apps, which is jarring.
     //
-    // We send PgUp / PgDn (count-scaled by deltaY) rather than arrow keys
-    // because:
-    //   - Copilot CLI reserves ↑/↓ for input-history navigation
-    //     ("Navigate the command history" in `copilot --help`) and uses
-    //     PgUp/PgDn for timeline scroll. Arrow keys here would mis-trigger
+    // We send PgUp / PgDn (NOT arrow keys) because:
+    //   - Copilot CLI reserves ↑/↓ for input-history navigation and uses
+    //     PgUp/PgDn for timeline scroll. Arrow keys here mis-trigger
     //     prompt-history editing instead of scrolling.
     //   - vim / less / man / htop all accept PgUp/PgDn for "scroll a page".
-    //   - Most TUIs that bind arrow keys to a navigation other than scroll
-    //     (menu selection, cursor movement) still treat PgUp/PgDn as a
-    //     scroll affordance.
-    // Trade-off: one wheel notch = roughly one page, so scrolling feels
-    // coarser than in the main buffer. That matches how Copilot's own
-    // shortcut is documented ("scroll the timeline up or down by one page")
-    // and is the right granularity for a TUI that doesn't expose
-    // line-by-line scroll.
+    //
+    // Granularity is the hard part. Copilot has *no* line-by-line scroll —
+    // PgUp/PgDn is the only timeline-scroll affordance, and one keypress
+    // moves a full screen. A naive "1 wheel event = 1 PgUp" implementation
+    // is unusable on trackpads: a single inertial fling fires 20-50 wheel
+    // events in a few hundred ms and shoots the user past the top of the
+    // buffer.
+    //
+    // The handler combines three guards:
+    //   1. **Accumulator**: small wheel deltas are summed until they reach
+    //      a per-page threshold, then one PgUp/PgDn is emitted. A tiny
+    //      single click doesn't immediately jump a page — the user has to
+    //      scroll roughly one screen's worth before anything moves.
+    //   2. **Rate gate**: at most one emission per ~120ms, regardless of
+    //      how many events fire in that window. Caps trackpad flings at
+    //      ~8 pages/sec.
+    //   3. **Idle reset + bound**: the accumulator resets on direction
+    //      change or after 800ms of no scroll, and is clamped to ±2 pages
+    //      so an overshooting fling can't queue a long tail of page jumps
+    //      that fire after the user's hand has left the trackpad.
     this.term.attachCustomWheelEventHandler((e) => {
       if (this.term.buffer.active.type !== 'alternate') return true;
       if (e.ctrlKey || e.altKey || e.metaKey) return true; // leave room for zoom etc.
@@ -276,15 +292,43 @@ export class TerminalNode {
       } else {
         lines = e.deltaY / lineHeightPx;
       }
-      // Convert "lines scrolled" → "pages to emit". One wheel notch on most
-      // mice is ~3 lines (DOM_DELTA_LINE) or ~100 px (DOM_DELTA_PIXEL); both
-      // round to less than one page, so a notch emits exactly one PgUp/PgDn.
-      // A big trackpad swipe (100+ lines) caps at 5 pages so a single fling
-      // doesn't shoot past the user's intended target.
-      const pageSize = Math.max(this.term.rows - 2, 1); // -2 keeps a sliver of context across pages
-      const count = Math.min(5, Math.max(1, Math.round(Math.abs(lines) / pageSize)));
-      const seq = lines > 0 ? '\x1b[6~' : '\x1b[5~';
-      this.send({ type: 'input', data: seq.repeat(count) });
+
+      const now = Date.now();
+      // Idle reset: if the user paused, residual accumulation from a
+      // previous fling shouldn't carry over and cause a surprise page jump
+      // on the next wheel touch.
+      if (now - this.wheelLastSeen > 800) this.wheelAccum = 0;
+      // Direction change clears accumulator so reversal feels responsive.
+      if (this.wheelAccum !== 0 && Math.sign(lines) !== Math.sign(this.wheelAccum)) {
+        this.wheelAccum = 0;
+      }
+      this.wheelAccum += lines;
+      this.wheelLastSeen = now;
+
+      const threshold = Math.max(this.term.rows - 2, 1); // ~one screen
+      // Bound the accumulator at ±2 pages so a single fling can never
+      // queue more than 1 follow-up page after the initial emission.
+      const maxAccum = threshold * 2;
+      if (Math.abs(this.wheelAccum) > maxAccum) {
+        this.wheelAccum = Math.sign(this.wheelAccum) * maxAccum;
+      }
+
+      // Not enough accumulated to be worth a page jump — swallow the event
+      // but don't emit anything.
+      if (Math.abs(this.wheelAccum) < threshold) {
+        e.preventDefault();
+        return false;
+      }
+      // Rate gate to keep fling-rate sane.
+      if (now - this.wheelLastEmit < 120) {
+        e.preventDefault();
+        return false;
+      }
+
+      const down = this.wheelAccum > 0;
+      this.wheelAccum -= (down ? 1 : -1) * threshold;
+      this.wheelLastEmit = now;
+      this.send({ type: 'input', data: down ? '\x1b[6~' : '\x1b[5~' });
       e.preventDefault();
       return false;
     });
