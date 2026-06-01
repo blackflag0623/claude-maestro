@@ -238,6 +238,28 @@ export class TerminalNode {
     // (or PgUp/PgDn with Shift) escape sequences and forwarded to the app,
     // which interprets them as line-by-line (or page) navigation. Mirror
     // that here so Copilot CLI's history can be browsed with the mouse.
+    // Alt-screen-buffer wheel translation.
+    //
+    // Apps that take over the alt screen (Copilot CLI, Claude Code's TUI in
+    // some modes, vim, less, htop) own their own scrollback — xterm's
+    // viewport buffer has no history to scroll. Without translation, the
+    // mouse wheel is a complete no-op in these apps, which is jarring.
+    //
+    // We send PgUp / PgDn (count-scaled by deltaY) rather than arrow keys
+    // because:
+    //   - Copilot CLI reserves ↑/↓ for input-history navigation
+    //     ("Navigate the command history" in `copilot --help`) and uses
+    //     PgUp/PgDn for timeline scroll. Arrow keys here would mis-trigger
+    //     prompt-history editing instead of scrolling.
+    //   - vim / less / man / htop all accept PgUp/PgDn for "scroll a page".
+    //   - Most TUIs that bind arrow keys to a navigation other than scroll
+    //     (menu selection, cursor movement) still treat PgUp/PgDn as a
+    //     scroll affordance.
+    // Trade-off: one wheel notch = roughly one page, so scrolling feels
+    // coarser than in the main buffer. That matches how Copilot's own
+    // shortcut is documented ("scroll the timeline up or down by one page")
+    // and is the right granularity for a TUI that doesn't expose
+    // line-by-line scroll.
     this.term.attachCustomWheelEventHandler((e) => {
       if (this.term.buffer.active.type !== 'alternate') return true;
       if (e.ctrlKey || e.altKey || e.metaKey) return true; // leave room for zoom etc.
@@ -254,18 +276,14 @@ export class TerminalNode {
       } else {
         lines = e.deltaY / lineHeightPx;
       }
-      const count = Math.min(10, Math.max(1, Math.round(Math.abs(lines))));
-      const down = lines > 0;
-      const appCursor = this.term.modes.applicationCursorKeysMode;
-      // Shift+wheel → PgUp/PgDn for faster scrolling, matching common terminals.
-      let seq: string;
-      if (e.shiftKey) {
-        seq = down ? '\x1b[6~' : '\x1b[5~';
-      } else if (appCursor) {
-        seq = down ? '\x1bOB' : '\x1bOA';
-      } else {
-        seq = down ? '\x1b[B' : '\x1b[A';
-      }
+      // Convert "lines scrolled" → "pages to emit". One wheel notch on most
+      // mice is ~3 lines (DOM_DELTA_LINE) or ~100 px (DOM_DELTA_PIXEL); both
+      // round to less than one page, so a notch emits exactly one PgUp/PgDn.
+      // A big trackpad swipe (100+ lines) caps at 5 pages so a single fling
+      // doesn't shoot past the user's intended target.
+      const pageSize = Math.max(this.term.rows - 2, 1); // -2 keeps a sliver of context across pages
+      const count = Math.min(5, Math.max(1, Math.round(Math.abs(lines) / pageSize)));
+      const seq = lines > 0 ? '\x1b[6~' : '\x1b[5~';
       this.send({ type: 'input', data: seq.repeat(count) });
       e.preventDefault();
       return false;
