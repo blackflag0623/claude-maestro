@@ -227,6 +227,50 @@ export class TerminalNode {
     this.term.onData((data) => this.send({ type: 'input', data }));
     this.term.onResize(({ cols, rows }) => this.send({ type: 'resize', cols, rows }));
 
+    // Alternate-screen-buffer mouse wheel translation. TUI apps that take
+    // over the screen (vim, less, htop, Claude Code, Copilot CLI) switch
+    // xterm into the alternate buffer (`\x1b[?1049h`). The alt buffer has
+    // no scrollback by design — the app draws its own content into the
+    // visible viewport and handles its own history navigation. xterm.js
+    // does not translate wheel events in this mode, so the user appears
+    // unable to scroll. Windows Terminal solves this with its on-by-default
+    // "alternateScroll" feature: wheel events get rewritten into arrow-key
+    // (or PgUp/PgDn with Shift) escape sequences and forwarded to the app,
+    // which interprets them as line-by-line (or page) navigation. Mirror
+    // that here so Copilot CLI's history can be browsed with the mouse.
+    this.term.attachCustomWheelEventHandler((e) => {
+      if (this.term.buffer.active.type !== 'alternate') return true;
+      if (e.ctrlKey || e.altKey || e.metaKey) return true; // leave room for zoom etc.
+      if (e.deltaY === 0) return true; // horizontal scroll only — let xterm handle
+
+      const fontSize = this.term.options.fontSize ?? 13;
+      const lineHeight = this.term.options.lineHeight ?? 1.2;
+      const lineHeightPx = fontSize * lineHeight;
+      let lines: number;
+      if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+        lines = e.deltaY;
+      } else if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+        lines = e.deltaY * this.term.rows;
+      } else {
+        lines = e.deltaY / lineHeightPx;
+      }
+      const count = Math.min(10, Math.max(1, Math.round(Math.abs(lines))));
+      const down = lines > 0;
+      const appCursor = this.term.modes.applicationCursorKeysMode;
+      // Shift+wheel → PgUp/PgDn for faster scrolling, matching common terminals.
+      let seq: string;
+      if (e.shiftKey) {
+        seq = down ? '\x1b[6~' : '\x1b[5~';
+      } else if (appCursor) {
+        seq = down ? '\x1bOB' : '\x1bOA';
+      } else {
+        seq = down ? '\x1b[B' : '\x1b[A';
+      }
+      this.send({ type: 'input', data: seq.repeat(count) });
+      e.preventDefault();
+      return false;
+    });
+
     this.connect();
   }
 
