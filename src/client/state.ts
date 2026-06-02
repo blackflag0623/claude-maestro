@@ -1,5 +1,4 @@
 import type { SessionInfo } from '../shared/protocol';
-import { uuid } from '../client-shared/uuid';
 
 export interface ServerEntry {
   id: string;          // local uuid

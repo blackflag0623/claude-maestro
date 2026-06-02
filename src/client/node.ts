@@ -9,26 +9,8 @@ import { ImageAddon, type IImageAddonOptions } from '@xterm/addon-image';
 import '@xterm/xterm/css/xterm.css';
 import type { ClientMessage, ServerMessage, SessionInfo, SessionActivity } from '../shared/protocol';
 import type { MaestroApi } from '../client-shared/api';
-import { debug } from '../client-shared/debug';
 import { buildCursorIndicator, type CursorIndicator } from './cursor-indicator';
 import { buildSearchOverlay, type SearchOverlay } from './search-overlay';
-
-/** Scan a chunk of terminal output for alt-screen-buffer toggle escape
- *  sequences. Returns an array describing each toggle found, suitable for
- *  logging via `debug()`. Used to diagnose "why doesn't my wheel scroll
- *  work?" reports: Copilot CLI and Claude TUIs flip between the normal and
- *  alternate buffers at non-obvious moments (e.g. during resume replay),
- *  and the wheel-translation handler only fires for the alternate buffer. */
-function scanForAltToggles(s: string): string[] {
-  const out: string[] = [];
-  // CSI ? <n> h|l where n is one of 47, 1047, 1049.
-  const re = /\x1b\[\?(47|1047|1049)([hl])/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(s)) !== null) {
-    out.push(`?${m[1]}${m[2]} (${m[2] === 'h' ? 'enter-alt' : 'leave-alt'})`);
-  }
-  return out;
-}
 
 export type NodeStatus = 'connecting' | 'live' | 'reconnecting' | 'exited' | 'error';
 
@@ -41,12 +23,6 @@ export interface NodeEvents {
 const TERM_BG = '#0a0a0a';
 const TERM_FG = '#e8e8e3';
 const TERM_LIME = '#c6ff3d';
-
-/** Wheel-handler tuning constants (alt-screen-buffer TUI scroll translation).
- *  See attachCustomWheelEventHandler for the algorithm. Tweaked together —
- *  changing one usually requires re-tuning the others. */
-const WHEEL_IDLE_RESET_MS = 10_000; // window before residual accumulator is cleared
-const WHEEL_RATE_GATE_MS = 120;     // min ms between successive PgUp/PgDn emissions
 
 /**
  * One Node = one xterm Terminal bound to one server-owned session by id.
@@ -76,12 +52,6 @@ export class TerminalNode {
   private replayingScrollback = false;
   private newLinesWhileAway = 0;
   private prevBaseY = 0;
-  // Alt-buffer wheel-translation state (see attachCustomWheelEventHandler):
-  // accumulator + rate gate + idle reset together fix the "one wheel notch
-  // jumps N pages" problem for Copilot CLI and other paginated TUIs.
-  private wheelAccum = 0;
-  private wheelLastEmit = 0;
-  private wheelLastSeen = 0;
   session: SessionInfo | null = null;
 
   constructor(
@@ -169,22 +139,6 @@ export class TerminalNode {
     // typically prints (doc links, PRs, issues).
     this.term.loadAddon(new WebLinksAddon());
     this.term.open(this.el);
-
-    // Diagnostic: log when xterm flips between normal and alternate
-    // buffers. The wheel-translation handler in this file only intercepts
-    // wheel events when the active buffer is the alternate one — so
-    // knowing exactly when a Copilot/Claude TUI enters or leaves alt mode
-    // is essential when debugging "scroll wheel doesn't work" reports.
-    this.term.buffer.onBufferChange((b) => {
-      debug('[node]', this.sessionId, 'buffer-change ->', b.type, {
-        baseY: b.baseY,
-        viewportY: b.viewportY,
-        length: b.length,
-        cursorX: b.cursorX,
-        cursorY: b.cursorY,
-      });
-    });
-
     // WebGL renderer — falls back to DOM on context loss.
     try {
       const webgl = new WebglAddon();
@@ -272,190 +226,6 @@ export class TerminalNode {
 
     this.term.onData((data) => this.send({ type: 'input', data }));
     this.term.onResize(({ cols, rows }) => this.send({ type: 'resize', cols, rows }));
-
-    // Alternate-screen-buffer mouse wheel translation. TUI apps that take
-    // over the screen (vim, less, htop, Claude Code, Copilot CLI) switch
-    // xterm into the alternate buffer (`\x1b[?1049h`). The alt buffer has
-    // no scrollback by design — the app draws its own content into the
-    // visible viewport and handles its own history navigation. xterm.js
-    // does not translate wheel events in this mode, so the user appears
-    // unable to scroll. Windows Terminal solves this with its on-by-default
-    // "alternateScroll" feature: wheel events get rewritten into arrow-key
-    // (or PgUp/PgDn with Shift) escape sequences and forwarded to the app,
-    // which interprets them as line-by-line (or page) navigation. Mirror
-    // that here so Copilot CLI's history can be browsed with the mouse.
-    // Alt-screen-buffer wheel translation.
-    //
-    // Apps that take over the alt screen (Copilot CLI, Claude Code's TUI in
-    // some modes, vim, less, htop) own their own scrollback — xterm's
-    // viewport buffer has no history to scroll. Without translation, the
-    // mouse wheel is a complete no-op in these apps, which is jarring.
-    //
-    // We send PgUp / PgDn (NOT arrow keys) because:
-    //   - Copilot CLI reserves ↑/↓ for input-history navigation and uses
-    //     PgUp/PgDn for timeline scroll. Arrow keys here mis-trigger
-    //     prompt-history editing instead of scrolling.
-    //   - vim / less / man / htop all accept PgUp/PgDn for "scroll a page".
-    //
-    // Granularity is the hard part. Copilot has *no* line-by-line scroll —
-    // PgUp/PgDn is the only timeline-scroll affordance, and one keypress
-    // moves a full screen. A naive "1 wheel event = 1 PgUp" implementation
-    // is unusable on trackpads: a single inertial fling fires 20-50 wheel
-    // events in a few hundred ms and shoots the user past the top of the
-    // buffer.
-    //
-    // The handler combines three guards:
-    //   1. **Accumulator**: small wheel deltas are summed until they reach
-    //      a per-page threshold, then one PgUp/PgDn is emitted. A tiny
-    //      single click doesn't immediately jump a page — the user has to
-    //      scroll roughly one screen's worth before anything moves.
-    //   2. **Rate gate**: at most one emission per ~120ms, regardless of
-    //      how many events fire in that window. Caps trackpad flings at
-    //      ~8 pages/sec.
-    //   3. **Idle reset + bound**: the accumulator resets on direction
-    //      change or after 800ms of no scroll, and is clamped to ±2 pages
-    //      so an overshooting fling can't queue a long tail of page jumps
-    //      that fire after the user's hand has left the trackpad.
-    this.term.attachCustomWheelEventHandler((e) => {
-      const bufType = this.term.buffer.active.type;
-      if (bufType !== 'alternate') {
-        // Native xterm scroll handles this. Log so users can see *why* a
-        // wheel event wasn't translated (common cause of "I'm in Copilot
-        // CLI but the wheel does nothing useful" reports — Copilot may
-        // still be writing into the normal buffer during resume replay,
-        // before it ever issues `CSI ?1049h`).
-        debug('[node]', this.sessionId, 'wheel: pass-through (normal buffer)', {
-          deltaY: e.deltaY,
-          deltaMode: e.deltaMode,
-          baseY: this.term.buffer.active.baseY,
-          viewportY: this.term.buffer.active.viewportY,
-          length: this.term.buffer.active.length,
-        });
-        return true;
-      }
-      if (e.ctrlKey || e.altKey || e.metaKey) {
-        debug('[node]', this.sessionId, 'wheel: modifier held, skip translation', {
-          ctrl: e.ctrlKey, alt: e.altKey, meta: e.metaKey,
-        });
-        return true; // leave room for zoom etc.
-      }
-      if (e.deltaY === 0) {
-        debug('[node]', this.sessionId, 'wheel: deltaY=0 (horizontal), pass-through');
-        return true;
-      }
-
-      const fontSize = this.term.options.fontSize ?? 13;
-      const lineHeight = this.term.options.lineHeight ?? 1.2;
-      const lineHeightPx = fontSize * lineHeight;
-      let lines: number;
-      if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) {
-        lines = e.deltaY;
-      } else if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
-        lines = e.deltaY * this.term.rows;
-      } else {
-        lines = e.deltaY / lineHeightPx;
-      }
-
-      const now = Date.now();
-      const accumBefore = this.wheelAccum;
-      let resetReason: 'idle' | 'direction' | null = null;
-      // Idle reset: if the user paused for a very long time, residual
-      // accumulation from a previous fling shouldn't carry over and cause a
-      // surprise page jump on the next wheel touch. The window must be long
-      // enough that a *deliberate* clicky-mouse-wheel user (one notch every
-      // ~few seconds) still accumulates progress — earlier tunings at 800 ms
-      // and 2500 ms were both too aggressive and made slow scrolling almost
-      // silent (each notch reset to 0 before the next arrived, so the
-      // accumulator never crossed threshold). The direction-change reset
-      // below is the real safety net against stale carry-over.
-      if (now - this.wheelLastSeen > WHEEL_IDLE_RESET_MS) {
-        if (this.wheelAccum !== 0) resetReason = 'idle';
-        this.wheelAccum = 0;
-      }
-      // Direction change clears accumulator so reversal feels responsive.
-      if (this.wheelAccum !== 0 && Math.sign(lines) !== Math.sign(this.wheelAccum)) {
-        resetReason = 'direction';
-        this.wheelAccum = 0;
-      }
-      this.wheelAccum += lines;
-      this.wheelLastSeen = now;
-
-      // Threshold = how many "lines" of accumulated wheel delta correspond
-      // to one PgUp/PgDn emission. Lower = more responsive single-burst (you
-      // see Copilot move after fewer notches) AND more emissions per long
-      // burst (so a 20-notch fling produces multiple progressive page jumps
-      // instead of one delayed teleport, which makes "where am I?"
-      // disorientation much less likely). Each emission still moves a full
-      // Copilot page — we can't change that — but progressive feedback is
-      // dramatically better UX than no-movement-then-sudden-page-jump.
-      const threshold = Math.max(Math.floor(this.term.rows / 2), 6);
-      // Bound the accumulator at ±2 pages so a single fling can never
-      // queue more than 1 follow-up page after the initial emission.
-      const maxAccum = threshold * 2;
-      let clamped = false;
-      if (Math.abs(this.wheelAccum) > maxAccum) {
-        this.wheelAccum = Math.sign(this.wheelAccum) * maxAccum;
-        clamped = true;
-      }
-
-      // Not enough accumulated to be worth a page jump — swallow the event
-      // but don't emit anything.
-      if (Math.abs(this.wheelAccum) < threshold) {
-        debug(
-          '[node]', this.sessionId,
-          `wheel: accumulate ${this.wheelAccum.toFixed(1)}/${threshold}` +
-            (resetReason ? ` (reset:${resetReason})` : '') +
-            (clamped ? ' (clamped)' : ''),
-          {
-            deltaY: e.deltaY,
-            deltaMode: e.deltaMode,
-            lines: +lines.toFixed(2),
-            accumBefore: +accumBefore.toFixed(2),
-            accumAfter: +this.wheelAccum.toFixed(2),
-            threshold,
-            clamped,
-            resetReason,
-            msSinceLastWheel: now - this.wheelLastSeen,
-          },
-        );
-        e.preventDefault();
-        return false;
-      }
-      // Rate gate to keep fling-rate sane.
-      if (now - this.wheelLastEmit < WHEEL_RATE_GATE_MS) {
-        debug(
-          '[node]', this.sessionId,
-          `wheel: rate-gated (${now - this.wheelLastEmit}ms < ${WHEEL_RATE_GATE_MS}ms)`,
-          {
-            accum: +this.wheelAccum.toFixed(2),
-            threshold,
-          },
-        );
-        e.preventDefault();
-        return false;
-      }
-
-      const down = this.wheelAccum > 0;
-      this.wheelAccum -= (down ? 1 : -1) * threshold;
-      this.wheelLastEmit = now;
-      this.send({ type: 'input', data: down ? '\x1b[6~' : '\x1b[5~' });
-      debug(
-        '[node]', this.sessionId,
-        `wheel: EMIT ${down ? 'PgDn' : 'PgUp'}` +
-          (resetReason ? ` (reset:${resetReason})` : '') +
-          (clamped ? ' (clamped)' : ''),
-        {
-          deltaY: e.deltaY,
-          lines: +lines.toFixed(2),
-          accumAfter: +this.wheelAccum.toFixed(2),
-          threshold,
-          clamped,
-          resetReason,
-        },
-      );
-      e.preventDefault();
-      return false;
-    });
 
     this.connect();
   }
@@ -608,10 +378,6 @@ ${body}
       this.prevBaseY = 0;
       this.newLinesWhileAway = 0;
       this.updateJumpPill();
-      debug('[node]', this.sessionId, 'ws open -> attach', {
-        cols: this.term.cols,
-        rows: this.term.rows,
-      });
       this.send({ type: 'attach', cols: this.term.cols, rows: this.term.rows });
     };
 
@@ -629,16 +395,6 @@ ${body}
         // Copilot CLI relies on xterm's native cursor to show where input
         // lands; Claude draws its own inline reverse-video block.
         this.el.dataset.agent = msg.session.agentType ?? 'claude';
-        const sbLen = msg.scrollback?.length ?? 0;
-        const sbToggles = msg.scrollback ? scanForAltToggles(msg.scrollback) : [];
-        debug('[node]', this.sessionId, 'attached', {
-          agent: msg.session.agentType,
-          alive: msg.session.alive,
-          activity: msg.session.activity,
-          scrollbackBytes: sbLen,
-          altToggles: sbToggles,
-          bufTypeBeforeReplay: this.term.buffer.active.type,
-        });
         if (msg.scrollback) {
           // Suppress the jump-pill new-line counter while we replay the
           // server's scrollback ring — otherwise every reconnect would
@@ -649,35 +405,20 @@ ${body}
             this.prevBaseY = this.term.buffer.active.baseY;
             this.newLinesWhileAway = 0;
             this.updateJumpPill();
-            debug('[node]', this.sessionId, 'scrollback replay done', {
-              bufType: this.term.buffer.active.type,
-              baseY: this.term.buffer.active.baseY,
-              viewportY: this.term.buffer.active.viewportY,
-              length: this.term.buffer.active.length,
-            });
           });
         }
         this.setStatus(msg.session.alive ? 'live' : 'exited');
         this.setActivity(msg.session.activity ?? 'unknown');
         this.events.title?.(msg.session.title);
       } else if (msg.type === 'output') {
-        const toggles = scanForAltToggles(msg.data);
-        if (toggles.length > 0) {
-          debug('[node]', this.sessionId, 'output: alt-screen toggle', toggles, {
-            bytes: msg.data.length,
-            bufTypeBefore: this.term.buffer.active.type,
-          });
-        }
         this.term.write(msg.data);
       } else if (msg.type === 'activity') {
         this.setActivity(msg.activity);
       } else if (msg.type === 'exit') {
-        debug('[node]', this.sessionId, 'exit', { code: msg.code });
         this.term.write(`\r\n\x1b[2m[process exited: ${msg.code}]\x1b[0m\r\n`);
         this.setStatus('exited');
         this.setActivity('unknown');
       } else if (msg.type === 'error') {
-        debug('[node]', this.sessionId, 'error frame', msg);
         this.term.write(`\r\n\x1b[31m[error: ${msg.message}]\x1b[0m\r\n`);
         this.setStatus('error');
       }
@@ -685,7 +426,6 @@ ${body}
 
     ws.onclose = () => {
       this.ws = null;
-      debug('[node]', this.sessionId, 'ws close', { destroyed: this.destroyed, status: this._status });
       if (this.destroyed) return;
       if (this._status === 'exited') return; // session is gone, don't retry
       this.scheduleReconnect();
@@ -723,16 +463,6 @@ ${body}
       this.newLinesWhileAway = Math.min(this.newLinesWhileAway + grew, 9999);
     }
     if (atBottom) this.newLinesWhileAway = 0;
-    debug('[node]', this.sessionId, 'scroll', {
-      bufType: buf.type,
-      baseY,
-      viewportY,
-      length: buf.length,
-      grew,
-      atBottom,
-      newLinesWhileAway: this.newLinesWhileAway,
-      replayingScrollback: this.replayingScrollback,
-    });
     this.updateJumpPill();
   }
 
