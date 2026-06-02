@@ -123,7 +123,8 @@ export function saveState(s: PersistedState) {
   }
 }
 
-export { uuid } from '../client-shared/uuid';
+import { uuid } from '../client-shared/uuid';
+export { uuid };
 
 export interface ExportBundle {
   format: 'claude-maestro/servers';
