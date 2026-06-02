@@ -7,7 +7,7 @@ import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import * as pty from '@lydell/node-pty';
 import { ScrollbackBuffer } from './scrollback.js';
-import { debug } from './debug.js';
+import { debug, debugEnabled } from './debug.js';
 import type {
   AgentType,
   ChatMessage,
@@ -346,6 +346,53 @@ function setActivity(s: Session, a: SessionActivity) {
  *  agent a final chance to flush any tail-end transcript writes. */
 const READER_DISPOSE_GRACE_MS = 1500;
 
+/** Scan a chunk of PTY output for alt-screen-buffer toggle escape sequences
+ *  (`CSI ?47/?1047/?1049 h|l`). Returns a short human-readable label per
+ *  occurrence. Used in the PTY data-stream debug log to investigate "wheel
+ *  scroll does nothing after resume" — if a resumed agent never emits an
+ *  `enter-alt` toggle, the terminal stays in the normal buffer where our
+ *  wheel-translation handler is inactive (and there's typically nothing in
+ *  xterm's scrollback to navigate either). */
+function scanAltScreenToggles(s: string): string[] {
+  const out: string[] = [];
+  const re = /\x1b\[\?(47|1047|1049)([hl])/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    out.push(`?${m[1]}${m[2]} (${m[2] === 'h' ? 'enter-alt' : 'leave-alt'})`);
+  }
+  return out;
+}
+
+/** Detect screen-clear / line-clear escape sequences. Resumed agents that
+ *  emit `CSI 2J` (clear entire screen) or `CSI 3J` (clear scrollback) will
+ *  destroy any visible history before the user can scroll to it. */
+function scanClearScreen(s: string): string[] {
+  const out: string[] = [];
+  const re = /\x1b\[(2J|3J|H)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    const code = m[1];
+    out.push(code === '2J' ? 'CSI 2J (clear screen)'
+           : code === '3J' ? 'CSI 3J (clear scrollback)'
+           : 'CSI H (cursor home)');
+  }
+  return out;
+}
+
+/** Hex-dump the first N bytes of a UTF-8 string (renders ESC, NL, CR as
+ *  letters to keep the log compact and grep-friendly). */
+function hexHead(s: string, n: number): string {
+  const buf = Buffer.from(s, 'utf8').subarray(0, n);
+  return [...buf].map((b) => b.toString(16).padStart(2, '0')).join(' ')
+    + (Buffer.byteLength(s, 'utf8') > n ? ' …' : '');
+}
+function hexTail(s: string, n: number): string {
+  const all = Buffer.from(s, 'utf8');
+  const buf = all.subarray(Math.max(0, all.length - n));
+  return (all.length > n ? '… ' : '')
+    + [...buf].map((b) => b.toString(16).padStart(2, '0')).join(' ');
+}
+
 function spawnAgent(s: Session, mode: 'new' | 'resume') {
   const strategy = getStrategy(s.agentType);
 
@@ -384,6 +431,16 @@ function spawnAgent(s: Session, mode: 'new' | 'resume') {
     },
   };
 
+  debug('[spawn]', s.id, {
+    agent: s.agentType,
+    mode,
+    cwd: s.cwd,
+    cols: s.cols,
+    rows: s.rows,
+    hasResumeData: s.hasResumeData,
+    agentState: s.agentState,
+  });
+
   const term = strategy.spawn(target, mode);
   s.term = term;
   s.alive = true;
@@ -398,9 +455,40 @@ function spawnAgent(s: Session, mode: 'new' | 'resume') {
     });
   }
 
+  // Diagnostic counters for the PTY data stream. Used to investigate
+  // "scrollback is empty after resume" reports — if an agent emits very
+  // little (or only screen-clear escapes) on `--resume`, we'll see it here.
+  let ptyChunks = 0;
+  let ptyBytes = 0;
+  let firstChunkLogged = false;
+
   term.onData((data: string) => {
     appendScrollback(s, data);
     broadcastTerminal(s, { type: 'output', data });
+    if (debugEnabled) {
+      ptyChunks++;
+      ptyBytes += data.length;
+      const toggles = scanAltScreenToggles(data);
+      const clears = scanClearScreen(data);
+      if (!firstChunkLogged) {
+        firstChunkLogged = true;
+        debug('[pty]', s.id, 'first chunk', {
+          bytes: data.length,
+          altToggles: toggles,
+          screenClears: clears,
+          headHex: hexHead(data, 64),
+          tailHex: hexTail(data, 32),
+        });
+      } else if (toggles.length || clears.length) {
+        debug('[pty]', s.id, 'chunk with mode toggles', {
+          bytes: data.length,
+          totalChunks: ptyChunks,
+          totalBytes: ptyBytes,
+          altToggles: toggles,
+          screenClears: clears,
+        });
+      }
+    }
     // Once we've seen *any* output, the conversation file exists on disk.
     if (!s.hasResumeData) {
       s.hasResumeData = true;
