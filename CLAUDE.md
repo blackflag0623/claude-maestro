@@ -6,10 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `npm run dev` — runs server (`tsx watch` on `src/server/index.ts`, port 4050), Vite desktop client (port 4051), and Vite mobile client (port 4052) concurrently. Both Vite servers proxy `/api` and `/maestro-ws` to the backend.
 - `npm run dev:server` / `npm run dev:client` / `npm run dev:client:mobile` — run one piece alone.
-- `npm run build` — desktop `vite build` → `dist/client`, then mobile `vite build --config vite.mobile.config.ts` → `dist/client-mobile`, then `tsc -p tsconfig.server.json` → `dist/server`.
+- `npm run build` — desktop `vite build` → `dist/client`, then mobile `vite build --config vite.mobile.config.ts` → `dist/client-mobile`, then `tsc -p tsconfig.server.json` → `dist/server`. Only the server gets strict typechecking here; Vite's client/mobile builds are esbuild-transpile-only.
+- `npm run typecheck` — `tsc --noEmit -p tsconfig.json` over the whole repo (covers the client and mobile entry points that `npm run build` does not strict-check). Run this before sending a PR that touches client code.
 - `npm start` — runs the built server (`node dist/server/index.js`), which serves the desktop client at `/` and the mobile chat client at `/m` from the same port.
 
-No test, lint, or typecheck scripts are configured.
+No test or lint scripts are configured.
 
 ## Debug logging
 
@@ -120,10 +121,31 @@ Copilot CLI writes one JSON event per line to `~/.copilot/session-state/<uuid>/e
 
 ### Client (`src/client/`) — desktop terminal portal
 
-- `state.ts` — localStorage-persisted `PersistedState`: `servers[]`, `activeNodes`, `knownNodes` (map of serverId → NodeRef[]), `lastCwd`, `lastAgentType` (last-picked agent per server for modal defaults). NodeRef carries an optional `agentType` so the sidebar can render the agent badge before `SessionInfo` arrives. Survives reload.
+The client is split into focused modules. `app-context.ts` owns the
+shared mutable state and DOM refs, every other UI module imports from
+it, and `main.ts` is a thin boot orchestrator. Import direction is
+strictly one-way: nothing imports back into `app-context`, no UI module
+imports from `main`, and the rough layering is
+`app-context → {topbar, sidebar-toggle, server-popup, drag-reorder,
+node, state, api} → {pane-manager, server-actions, node-actions} →
+{sidebar, modals, hotkeys} → main`. Keep new code in this shape — do
+not grow `main.ts` back into a god module.
+
+- `state.ts` — localStorage-persisted `PersistedState`: `servers[]`, `activeNodes`, `knownNodes` (map of serverId → NodeRef[]), `lastCwd`, `lastAgentType` (last-picked agent per server for modal defaults). NodeRef carries an optional `agentType` so the sidebar can render the agent badge before `SessionInfo` arrives. Survives reload. Also owns the bundle import/export (`importBundle` returns `{state, result}`; `result` has `{added, skipped}` counts).
 - `api.ts` — `MaestroApi` per server URL: `health/list/create/kill` over HTTP; `wsUrl(sessionId)` builds the matching `ws(s)://…/maestro-ws?sessionId=…`. Same-origin URLs go through Vite proxy in dev. **Reused verbatim by the mobile client.**
 - `node.ts` — `TerminalNode` = one xterm `Terminal` + addons + WS for one server-owned session. Stays mounted (DOM detach via `unmount()`, no dispose) so switching nodes preserves visual state. Auto-reconnects with exp backoff; on each (re)connect calls `term.reset()` then re-attaches and replays scrollback. Implements Ctrl/Cmd+V → `clipboard.readText` → input (xterm swallows it otherwise — see KNOWN_ISSUES). Addons loaded: **FitAddon** (resize), **WebglAddon** (renderer, falls back to DOM on context loss), **WebLinksAddon** (hover/click http(s) URLs), **SearchAddon** (find-in-buffer with brand-colored decorations, exposed via `toggleSearch()` + the floating overlay in `search-overlay.ts`), **SerializeAddon** (buffer dump, exposed via `serialize()` / `serializeAsHTML()` and consumed by the ⌘⇧S snapshot hotkey).
-- `main.ts` — orchestrator. Sidebar (servers + nodes tree with `[cla]`/`[cop]` agent badges), topbar (breadcrumb + status pulse + layout-switch + **node-actions group**), stage. New-node modal exposes an **agent** `<select>` next to `cwd`. First-run seeds a `local` server pointing at the current origin. Polls `/api/health`-via-`/api/sessions` every 10 s per server. Owns global hotkeys (capture-phase document `keydown` so xterm doesn't swallow them, ignored while any `<dialog open>` is present): **⌘/Ctrl+B** toggles sidebar, **⌘/Ctrl+F** opens find-in-node on the focused pane, **⌘/Ctrl+Shift+S** downloads `.txt` snapshot (ANSI preserved), **⌘/Ctrl+Shift+H** downloads styled `.html` snapshot. Every keyboard shortcut has an equivalent button in the topbar `node-actions` group so the features are discoverable without keyboard knowledge; buttons go `[disabled]` when no node is focused.
+- `app-context.ts` — the foundation module: `getState()` / `setState()`, the mutable runtime maps (`servers`, `nodes`, `explorers`, `explorerOpen`), all DOM `$refs`, primitive helpers (`nodeKey`, `runtimeFor`, `findSlotOf`, `isActive`, `persist`), and the render scheduler. Other modules call `scheduleRender()` freely; `main.ts` registers the actual callback once via `setRenderCallback` to avoid circular imports.
+- `topbar.ts` — `renderTopbar` (breadcrumb), `renderHud` / `renderStageTag`, `setStatus` (server pulse), the uptime ticker, and shortcut localization (`IS_MAC`, `modGlyph`, `localizeShortcuts`).
+- `sidebar.ts` — `renderSidebar` (servers + nodes tree with `[cla]`/`[cop]` agent badges). Coordinates with `server-popup` and `drag-reorder` via the `sidebarHasPendingRender` / `flushSidebarIfPending` flag, so renders that would yank the popup or drag target are deferred until the interaction ends.
+- `sidebar-toggle.ts` — `applySidebarState` + `toggleSidebar` with the View Transitions API fallback. **⌘/Ctrl+B** is wired in `hotkeys.ts`.
+- `server-popup.ts` — the hover popup on server rows (open/close/position, plus `installServerPopupGlobalListeners()` for the once-per-app scroll/resize/Escape handlers).
+- `drag-reorder.ts` — FLIP-animated drag-and-drop for sidebar reorder. Exports `attachDrag`, `isDragging`, `currentDrag`, and `commitDragOrderFromDom`.
+- `pane-manager.ts` — owns pane DOM, layout state, and focus: `getOrCreateNode` / `getOrCreateExplorer`, `toggleExplorer`, `destroyNode(sForServer)`, `setLayoutMode`, `placeInSlot` / `detachSlot`, `focusPane`, `selectNode`, plus the `focusedNode` / `focusedRef` getters consumed by `hotkeys` and `node-actions`.
+- `server-actions.ts` — `refreshServer` / `refreshAll` (the 10 s poller calls `refreshAll`), `addServer`, `removeServer`.
+- `node-actions.ts` — `createNode`, `killNode`.
+- `modals.ts` — `openNodeModal` and `installModals()` (wires server + node modal submits, import/export). The new-node modal exposes an **agent** `<select>` next to `cwd`. Modal backdrop close uses the `data-close` attribute, not `e.target === modal`.
+- `hotkeys.ts` — `installHotkeys()` registers the capture-phase document `keydown` (so xterm doesn't swallow them, ignored while any `<dialog open>` is present) and the topbar layout-switch + **node-actions group** buttons. Hotkeys: **⌘/Ctrl+B** toggles sidebar, **⌘/Ctrl+F** opens find-in-node on the focused pane, **⌘/Ctrl+Shift+S** downloads `.txt` snapshot (ANSI preserved), **⌘/Ctrl+Shift+H** downloads styled `.html` snapshot. Every shortcut has an equivalent topbar button so the features are discoverable without keyboard knowledge; buttons go `[disabled]` when no node is focused.
+- `main.ts` — boot orchestrator only (~70 LoC). Registers the render callback, starts the uptime ticker, calls every `install*()` entry point, seeds the local server on first run, mounts previously-active nodes via `getOrCreateNode`, then starts the 10 s polling interval. Do not add feature logic here — extend the relevant module instead.
 
 ### Mobile client (`src/client-mobile/`) — chat UI
 

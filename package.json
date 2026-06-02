@@ -9,6 +9,7 @@
     "dev:client": "vite --force",
     "dev:client:mobile": "vite --force --config vite.mobile.config.ts",
     "build": "vite build && vite build --config vite.mobile.config.ts && tsc -p tsconfig.server.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "start": "node dist/server/index.js"
   },
   "dependencies": {
