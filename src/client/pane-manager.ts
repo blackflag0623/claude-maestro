@@ -65,12 +65,74 @@ function getOrCreateExplorer(ref: NodeRef): FileExplorer {
   return exp;
 }
 
+// ──────── explorer column width (persisted, shared across panes) ────────
+const EXPLORER_WIDTH_KEY = 'maestro:explorerWidth';
+const EXPLORER_MIN = 220;
+const EXPLORER_MAX_FRAC = 0.85; // never let term shrink below 15% of pane
+function loadExplorerWidth(): number {
+  const raw = Number(localStorage.getItem(EXPLORER_WIDTH_KEY));
+  return Number.isFinite(raw) && raw >= EXPLORER_MIN ? raw : 320;
+}
+let explorerWidth = loadExplorerWidth();
+function applyExplorerWidth(pane: HTMLElement): void {
+  pane.style.setProperty('--explorer-w', `${explorerWidth}px`);
+}
+function attachExplorerResize(pane: HTMLElement, resizer: HTMLElement): void {
+  applyExplorerWidth(pane);
+  resizer.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const body = pane.querySelector<HTMLElement>('.pane__body.is-split');
+    if (!body) return;
+    const bodyRect = body.getBoundingClientRect();
+    const maxW = Math.floor(bodyRect.width * EXPLORER_MAX_FRAC);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    const move = (ev: MouseEvent) => {
+      const next = Math.max(EXPLORER_MIN, Math.min(maxW, bodyRect.right - ev.clientX));
+      explorerWidth = next;
+      // Apply to every pane that currently has an explorer open.
+      for (const p of document.querySelectorAll<HTMLElement>('.pane')) applyExplorerWidth(p);
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      localStorage.setItem(EXPLORER_WIDTH_KEY, String(explorerWidth));
+      // Let the terminal refit its grid to the new width.
+      window.dispatchEvent(new Event('resize'));
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+}
+
 export function toggleExplorer(ref: NodeRef): void {
   const key = nodeKey(ref.serverId, ref.sessionId);
-  if (explorerOpen.has(key)) {
-    explorerOpen.delete(key);
-  } else {
+  const opening = !explorerOpen.has(key);
+  if (opening) {
     explorerOpen.add(key);
+    // The explorer is hard to read in split/grid layouts (narrow column,
+    // tiny viewer). Force single-pane and promote this ref into slot 0 so
+    // the user sees the explorer for the pane they actually clicked.
+    const state = getState();
+    if (state.layoutMode !== 'single') {
+      state.layoutMode = 'single';
+      const next = state.activeNodes.slice();
+      const existing = next.findIndex(
+        (r) => r && r.serverId === ref.serverId && r.sessionId === ref.sessionId,
+      );
+      if (existing > 0) {
+        next[existing] = next[0] ?? null;
+      }
+      next[0] = ref;
+      state.activeNodes = next;
+      state.focusedPane = 0;
+      persist();
+    }
+  } else {
+    explorerOpen.delete(key);
   }
   renderPanes();
   scheduleRender();
@@ -182,7 +244,10 @@ function buildPane(slot: number): HTMLElement {
     <div class="pane__body${ref ? '' : ' is-empty'}${openExp ? ' is-split' : ''}">${
       ref
         ? '<div class="pane__term" data-role="term"></div>' +
-          (openExp ? '<div class="pane__explorer" data-role="explorer"></div>' : '')
+          (openExp
+            ? '<div class="pane__resizer" data-role="resizer" title="drag to resize"></div>' +
+              '<div class="pane__explorer" data-role="explorer"></div>'
+            : '')
         : '<span class="pane__hint">empty — pick a node from the sidebar, or drop one here</span>'
     }</div>
   `;
@@ -201,6 +266,8 @@ function buildPane(slot: number): HTMLElement {
       e.stopPropagation();
       toggleExplorer(ref);
     });
+    const resizer = pane.querySelector<HTMLElement>('.pane__resizer');
+    if (resizer) attachExplorerResize(pane, resizer);
   }
 
   // Accept drag-drop of a sidebar node onto this pane.
@@ -270,6 +337,9 @@ export function setLayoutMode(mode: LayoutMode): void {
   if (state.layoutMode === mode) return;
   state.layoutMode = mode;
   if (state.focusedPane >= PANE_COUNT[mode]) state.focusedPane = 0;
+  // Switching to a multi-pane layout closes any open file explorers — the
+  // explorer is only useful in single-pane mode (see `toggleExplorer`).
+  if (mode !== 'single') explorerOpen.clear();
   persist();
   renderPanes();
   scheduleRender();

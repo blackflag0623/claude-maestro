@@ -3,3 +3,6 @@ dist
 .vite
 *.log
 bun.lock
+scripts/snaps/
+*.png
+!src/**/*.png

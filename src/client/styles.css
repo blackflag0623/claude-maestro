@@ -1322,7 +1322,7 @@ button { font: inherit; color: inherit; }
   background: rgba(198, 255, 61, 0.08);
   border-bottom-color: rgba(198, 255, 61, 0.4);
 }
-.stage[data-layout="single"] .pane__head { display: none; }
+/* single-pane uses the same pane chrome as split/grid — no overrides */
 
 .pane__bar {
   width: 4px;
@@ -1495,6 +1495,10 @@ button { font: inherit; color: inherit; }
   cursor: not-allowed;
   opacity: 0.35;
 }
+.node-actions button[aria-pressed="true"] {
+  background: var(--ink);
+  color: var(--lime);
+}
 
 /* ───────── pane: files toggle + split body ───────── */
 
@@ -1535,7 +1539,7 @@ button { font: inherit; color: inherit; }
   height: 100%;
 }
 .pane__explorer {
-  flex: 0 0 320px;
+  flex: 0 0 var(--explorer-w, 320px);
   min-width: 200px;
   border-left: 2px solid var(--ink);
   background: var(--bone);
@@ -1543,6 +1547,15 @@ button { font: inherit; color: inherit; }
   display: flex;
   flex-direction: column;
 }
+.pane__resizer {
+  flex: 0 0 8px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  z-index: 2;
+}
+.pane__resizer:hover { background: rgba(198, 255, 61, 0.18); }
+.pane__resizer:active { background: var(--lime); }
 
 /* ───────── file explorer ───────── */
 
@@ -1637,9 +1650,20 @@ button { font: inherit; color: inherit; }
   font-style: italic;
 }
 .fx__msg--err { color: var(--err); font-style: normal; }
+.fx__vsplit {
+  flex: 0 0 6px;
+  cursor: row-resize;
+  background: var(--ink);
+  opacity: 0.35;
+  position: relative;
+  z-index: 2;
+}
+.fx__vsplit:hover { opacity: 1; background: var(--lime); }
+.fx__vsplit.is-hidden { display: none; }
 .fx__viewer {
   border-top: 2px solid var(--ink);
-  max-height: 55%;
+  flex: 0 0 var(--fx-viewer-h, 55%);
+  min-height: 80px;
   display: flex;
   flex-direction: column;
   background: var(--bone);
@@ -1674,3 +1698,60 @@ button { font: inherit; color: inherit; }
   white-space: pre;
   background: var(--bone);
 }
+.fx__viewer-body code.hljs {
+  display: block;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  color: var(--ink);
+  white-space: pre;
+}
+.hljs-comment, .hljs-quote {
+  color: var(--muted);
+  font-style: italic;
+}
+.hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-meta-keyword {
+  color: var(--ink);
+  font-weight: 700;
+}
+.hljs-string, .hljs-regexp, .hljs-template-string, .hljs-symbol, .hljs-bullet {
+  color: #2a6e2a;
+}
+.hljs-number, .hljs-literal {
+  color: #b35a00;
+}
+.hljs-title, .hljs-title.function_, .hljs-title.class_, .hljs-section {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+.hljs-type, .hljs-class .hljs-title, .hljs-params {
+  color: #244a8a;
+}
+.hljs-attr, .hljs-attribute, .hljs-property, .hljs-name {
+  color: #244a8a;
+}
+.hljs-tag {
+  color: var(--ink);
+}
+.hljs-variable, .hljs-template-variable {
+  color: var(--ink);
+}
+.hljs-meta {
+  color: var(--muted);
+}
+.hljs-link {
+  color: #244a8a;
+  text-decoration: underline;
+}
+.hljs-deletion {
+  background: rgba(255, 61, 61, 0.18);
+  color: var(--err);
+}
+.hljs-addition {
+  background: rgba(198, 255, 61, 0.28);
+  color: var(--ink);
+}
+.hljs-emphasis { font-style: italic; }
+.hljs-strong   { font-weight: 700; }
